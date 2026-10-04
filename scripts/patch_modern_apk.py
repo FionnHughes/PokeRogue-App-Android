@@ -8,6 +8,9 @@ The Modern app's source is not public, so the fix is applied to its decoded code
      (the same script the legacy app injects, read from MainActivity.kt).
   2. The file picker shows all files instead of filtering on one MIME type,
      which can leave a .prsv greyed out.
+  3. Two hooks call importfix.SaveSync (modern-patch/src), which the workflow
+     compiles and adds to the APK as classes3.dex. It adds a "Sync from online"
+     button to the offline game.
 """
 import re
 import sys
@@ -56,6 +59,9 @@ def main() -> None:
     injected = (
         super_call
         + "\n"
+        + "    invoke-static {p1, p2}, Limportfix/SaveSync;->"
+        + "onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V\n"
+        + "\n"
         + f'    const-string v0, "{load_shim()}"\n'
         + "\n"
         + "    const/4 v1, 0x0\n"
@@ -75,7 +81,22 @@ def main() -> None:
         "file picker MIME type",
     )
     chrome.write_text(text)
-    print("patched LocalWebViewClient and LocalWebChromeClient")
+
+    # Register the sync helper on the game WebView, next to the app's own bridge.
+    game_view = root / "GameViewKt.smali"
+    text = game_view.read_text()
+    add_bridge = (
+        "    invoke-virtual {p2, p0, p1}, Landroid/webkit/WebView;->"
+        "addJavascriptInterface(Ljava/lang/Object;Ljava/lang/String;)V\n"
+    )
+    attach = (
+        add_bridge
+        + "\n"
+        + "    invoke-static {p2}, Limportfix/SaveSync;->attach(Landroid/webkit/WebView;)V\n"
+    )
+    text = replace_once(text, add_bridge, attach, "addJavascriptInterface call")
+    game_view.write_text(text)
+    print("patched LocalWebViewClient, LocalWebChromeClient and GameViewKt")
 
 
 if __name__ == "__main__":

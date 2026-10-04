@@ -1,6 +1,7 @@
 name: Patch Modern APK
 
-# Rebuilds the Modern (PodarSmarty) app with the save-import fix applied.
+# Rebuilds the Modern (PodarSmarty) app with the save-import fix applied and a
+# "Sync from online" button added to the offline game.
 # The result is published as a DRAFT release: only people with write access to
 # this repository can see or download it. That app is closed-source, so the
 # patched copy is for personal testing and is not redistributed publicly.
@@ -10,6 +11,7 @@ on:
     branches: [fix/android-save-import]
     paths:
       - scripts/patch_modern_apk.py
+      - modern-patch/**
       - .github/workflows/patch-modern-apk.yml
       - app/src/main/java/com/example/pokerogueoffline/MainActivity.kt
   workflow_dispatch:
@@ -47,6 +49,20 @@ jobs:
           echo "$APKTOOL_SHA256  apktool.jar" | sha256sum -c -
           echo "$SIGNER_SHA256  signer.jar" | sha256sum -c -
 
+      - name: Compile the sync helper
+        run: |
+          # The runner ships the Android SDK: android.jar to compile against, d8 to make a dex.
+          platform=$(ls "$ANDROID_HOME/platforms" | sort -V | tail -1)
+          tools=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          android_jar="$ANDROID_HOME/platforms/$platform/android.jar"
+          echo "using $platform and build-tools $tools"
+          mkdir -p work/helper/classes work/helper/dex
+          javac --release 8 -cp "$android_jar" -d work/helper/classes \
+            $(find modern-patch/src -name '*.java')
+          "$ANDROID_HOME/build-tools/$tools/d8" --min-api 28 --lib "$android_jar" \
+            --output work/helper/dex $(find work/helper/classes -name '*.class')
+          mv work/helper/dex/classes.dex work/helper/dex/classes3.dex
+
       - name: Decode, patch, rebuild, sign
         run: |
           cd work
@@ -60,6 +76,8 @@ jobs:
           # Only classes2.dex holds patched code; keep classes.dex byte-identical.
           mkdir orig && unzip -q -o modern.apk classes.dex -d orig
           (cd orig && zip -q -0 -X ../unsigned/modern.apk classes.dex)
+          # The compiled sync helper rides along as an extra code file.
+          (cd helper/dex && zip -q -0 -X ../../unsigned/modern.apk classes3.dex)
           java -jar signer.jar -a unsigned/modern.apk --out signed
           cp signed/modern-aligned-debugSigned.apk ../OfflineRogue-Modern-importfix.apk
 
@@ -74,6 +92,22 @@ jobs:
           done
           cmp <(unzip -p modern.apk classes.dex) <(unzip -p ../OfflineRogue-Modern-importfix.apk classes.dex)
 
+      - name: Check the hooks and the sync helper line up
+        run: |
+          cd work
+          # A hook that names a method the helper does not have would crash the app,
+          # so decode the finished APK and compare both sides.
+          java -jar apktool.jar d -r -f -o verify ../OfflineRogue-Modern-importfix.apk > /dev/null
+          helper=$(find verify -path '*importfix/SaveSync.smali')
+          sections=verify/smali_classes2/labs/smarty/offlinerogue/ui/composable/sections
+          test -n "$helper"
+          grep -qF '.method public static attach(Landroid/webkit/WebView;)V' "$helper"
+          grep -qF '.method public static onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$helper"
+          grep -qF '.method public sync()V' "$helper"
+          grep -qF 'Limportfix/SaveSync;->attach(Landroid/webkit/WebView;)V' "$sections/GameViewKt.smali"
+          grep -qF 'Limportfix/SaveSync;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$sections/LocalWebViewClient.smali"
+          echo "hooks and helper match"
+
       - name: Publish as a draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,5 +120,5 @@ jobs:
           gh release create "$tag" OfflineRogue-Modern-importfix.apk \
             --draft \
             --target "$GITHUB_SHA" \
-            --title "Modern app with import fix (private draft) ${GITHUB_SHA::7}" \
-            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix patched in. Untested on real devices until confirmed. Uninstall the existing Modern app before installing, because the signature differs. Draft on purpose: not for redistribution."
+            --title "Modern app with import fix and online sync (private draft) ${GITHUB_SHA::7}" \
+            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix and a Sync from online button patched in. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."
