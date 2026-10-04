@@ -1,7 +1,7 @@
 name: Patch Modern APK
 
-# Rebuilds the Modern (PodarSmarty) app with the save-import fix applied and a
-# "Sync from online" button added to the offline game.
+# Rebuilds the Modern (PodarSmarty) app with the save-import fix applied, a
+# "Sync saves" entry added to the drawer, and an on-screen log for Import Data.
 # The result is published as a DRAFT release: only people with write access to
 # this repository can see or download it. That app is closed-source, so the
 # patched copy is for personal testing and is not redistributed publicly.
@@ -103,9 +103,12 @@ jobs:
           test -n "$helper"
           grep -qF '.method public static attach(Landroid/webkit/WebView;)V' "$helper"
           grep -qF '.method public static onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$helper"
-          grep -qF '.method public sync()V' "$helper"
+          grep -qF '.method public static setActivity(Landroid/app/Activity;)V' "$helper"
+          grep -qF '.method public static openMenu()V' "$helper"
           grep -qF 'Limportfix/SaveSync;->attach(Landroid/webkit/WebView;)V' "$sections/GameViewKt.smali"
           grep -qF 'Limportfix/SaveSync;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$sections/LocalWebViewClient.smali"
+          grep -qF 'Limportfix/SaveSync;->openMenu()V' "$sections/ToolsSectionKt.smali"
+          grep -qF 'Limportfix/SaveSync;->setActivity(Landroid/app/Activity;)V' verify/smali_classes2/labs/smarty/offlinerogue/MainActivity.smali
           echo "hooks and helper match"
 
       - name: Publish as a draft release
@@ -121,4 +124,4 @@ jobs:
             --draft \
             --target "$GITHUB_SHA" \
             --title "Modern app with import fix and online sync (private draft) ${GITHUB_SHA::7}" \
-            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix and a Sync from online button patched in. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."
+            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix, a Sync saves entry in the drawer and an on-screen import log patched in. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."
