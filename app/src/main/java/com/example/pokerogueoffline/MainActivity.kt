@@ -2,6 +2,7 @@ package com.example.pokerogueoffline
 
 import android.Manifest
 import android.app.ProgressDialog
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -101,6 +102,29 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val FILE_CHOOSER_REQUEST_CODE = 1
         private const val PERMISSIONS_REQUEST_CODE = 2
+
+        // The game creates its save-import <input type="file"> without attaching it to the page
+        // and keeps no reference to it. While the picker is open the app is in the background,
+        // so the WebView can garbage-collect that input, and the chosen file is then dropped
+        // without the game's "change" handler ever running. Attaching the input to the page and
+        // holding a reference keeps it alive until the picker returns.
+        private val KEEP_FILE_INPUT_ALIVE_JS = """
+            (function() {
+                if (window.__keepFileInputAlive) { return; }
+                window.__keepFileInputAlive = true;
+                var originalClick = HTMLInputElement.prototype.click;
+                HTMLInputElement.prototype.click = function() {
+                    if (this.type === 'file') {
+                        window.__pendingFileInput = this;
+                        if (!this.isConnected && document.body) {
+                            this.style.display = 'none';
+                            document.body.appendChild(this);
+                        }
+                    }
+                    return originalClick.apply(this, arguments);
+                };
+            })();
+        """.trimIndent()
     }
 
     private var mFilePathCallback: ValueCallback<Array<Uri>>? = null
@@ -157,6 +181,7 @@ class MainActivity : AppCompatActivity() {
                             "\t\t}, 30); // Adjust the timeout as needed",
                     null
                 )
+                view?.evaluateJavascript(KEEP_FILE_INPUT_ALIVE_JS, null)
 
             }
         }
@@ -167,13 +192,23 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onShowFileChooser(webView: WebView?, filePathCallback: ValueCallback<Array<Uri>>?, fileChooserParams: FileChooserParams?): Boolean {
+                // A callback that is never answered blocks every later file chooser
+                mFilePathCallback?.onReceiveValue(null)
                 mFilePathCallback = filePathCallback
-                val intent = Intent(Intent.ACTION_GET_CONTENT)
+
+                // The system document picker hands back a readable content:// Uri for any provider.
+                // The type stays */* because Android has no MIME type for .prsv files.
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
                 intent.addCategory(Intent.CATEGORY_OPENABLE)
                 intent.type = "*/*"
-                startActivityForResult(Intent.createChooser(intent, "Choose File"), FILE_CHOOSER_REQUEST_CODE)
-                webView?.onPause() // Pause the WebView when the file chooser is opened
-                return true
+                return try {
+                    startActivityForResult(intent, FILE_CHOOSER_REQUEST_CODE)
+                    true
+                } catch (e: ActivityNotFoundException) {
+                    mFilePathCallback = null
+                    Toast.makeText(this@MainActivity, "No file picker available on this device", Toast.LENGTH_LONG).show()
+                    false
+                }
             }
         }
 
@@ -310,14 +345,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } else if (requestCode == FILE_CHOOSER_REQUEST_CODE) {
-            if (resultCode == RESULT_OK) {
-                val result = data?.data?.let { arrayOf(it) }
-                mFilePathCallback?.onReceiveValue(result)
-            } else {
-                mFilePathCallback?.onReceiveValue(null)
-            }
+            // onActivityResult runs before onResume, so wake the WebView first:
+            // the page has to be running to receive the file and read it.
+            webView.onResume()
+            val result = if (resultCode == RESULT_OK) data?.data?.let { arrayOf(it) } else null
+            mFilePathCallback?.onReceiveValue(result)
             mFilePathCallback = null
-            webView.onResume() // Resume the WebView when the file chooser is closed
         }
     }
 

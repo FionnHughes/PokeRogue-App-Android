@@ -1,0 +1,44 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, fix/android-save-import]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk PokeRogueOffline-importfix.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PokeRogueOffline-importfix
+          path: PokeRogueOffline-importfix.apk
+
+      # A release gives a direct .apk link that a phone can download and install
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="importfix-${GITHUB_SHA::7}"
+          gh release create "$tag" PokeRogueOffline-importfix.apk \
+            --title "Import fix build ${GITHUB_SHA::7}" \
+            --notes "Debug build of the Android save-import fix. Untested on real devices until confirmed." \
+            --target "$GITHUB_SHA"

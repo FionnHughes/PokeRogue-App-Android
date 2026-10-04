@@ -9,6 +9,9 @@ android {
 
     defaultConfig {
         applicationId = "com.example.pokerogueoffline"
+        // Separate package id so this build installs next to the original app
+        // instead of failing on a signature mismatch.
+        applicationIdSuffix = ".importfix"
         minSdk = 26
         targetSdk = 34
         versionCode = 2
