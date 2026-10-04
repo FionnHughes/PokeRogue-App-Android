@@ -3,9 +3,9 @@ package importfix;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
-import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -17,14 +17,10 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.lang.ref.WeakReference;
-import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.security.SecureRandom;
 import java.text.DateFormat;
 import java.util.Date;
 
@@ -36,19 +32,18 @@ import java.util.Date;
  * the online save over the offline one. It is one-way (online to offline) and
  * never uploads anything.
  *
- * The online save is fetched from the official server with the login the player
- * already has from Online mode in this app. The offline save lives in the WebView's
- * localStorage for the offline game's origin, so it is read and written by a small
- * hidden page served on that origin.
+ * Both saves are reached through a hidden WebView, one small page per origin:
+ * a page on the official site's origin fetches the online save exactly as the game
+ * does (same login cookie, same request), and a page on the offline game's origin
+ * reads and writes that game's localStorage.
  *
  * The Modern app has no public source, so this class is compiled separately and
  * added to the APK; a few one-line hooks in the app's own code call into it.
  */
 public final class SaveSync {
-    private static final String SITE = "https://pokerogue.net";
-    private static final String API = "https://api.pokerogue.net";
-    private static final String SESSION_COOKIE = "pokerogue_sessionId";
+    private static final String API_HOST = "api.pokerogue.net";
     private static final String OFFLINE_HOST = "localhost";
+    private static final String ONLINE_PAGE = "https://pokerogue.net/__savesync/online.html";
     private static final String HOST_PAGE = "https://localhost:8080/__savesync/index.html";
     private static final long CHECK_TIMEOUT_MS = 50000;
     private static final long APPLY_TIMEOUT_MS = 10000;
@@ -78,6 +73,22 @@ public final class SaveSync {
         if (isOfflineGame(url)) {
             view.evaluateJavascript(IMPORT_LOG_JS, null);
         }
+    }
+
+    /**
+     * Hook: Android handed the file picker's result back to the app. Adds it to the
+     * import log, which otherwise cannot tell "no file returned" from "user cancelled".
+     */
+    public static void onPickerResult(Uri uri) {
+        WebView game = gameRef.get();
+        if (game == null) {
+            return;
+        }
+        String note = uri == null
+                ? "Android gave the app NO file"
+                : "Android gave the app a file: " + uri.toString();
+        game.evaluateJavascript(
+                "window.__importLogNote && window.__importLogNote(" + JSONObject.quote(note) + ");", null);
     }
 
     /** Hook: the "Sync saves" drawer entry was tapped. Runs on the main thread. */
@@ -117,26 +128,18 @@ public final class SaveSync {
             host.setWebViewClient(new WebViewClient() {
                 @Override
                 public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                    // Serve the helper page from memory and let nothing else load.
-                    String body = HOST_PAGE.equals(request.getUrl().toString()) ? HOST_HTML : "";
+                    if (API_HOST.equals(request.getUrl().getHost())) {
+                        return null; // the one real network request: the official save API
+                    }
+                    // The two helper pages come from memory; nothing else may load.
+                    String url = request.getUrl().toString();
+                    String body = ONLINE_PAGE.equals(url) ? ONLINE_HTML : HOST_PAGE.equals(url) ? HOST_HTML : "";
                     return new WebResourceResponse("text/html", "utf-8",
                             new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
                 }
             });
-            host.loadUrl(HOST_PAGE);
-
-            final String token = sessionToken();
-            if (token == null) {
-                onlineProblem = "You are not logged in online. Open Online mode in this app, log in, then come back.";
-                fetchDone = true;
-            } else {
-                new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        download(token);
-                    }
-                }, "save-sync").start();
-            }
+            // Step 1: fetch the online save. Step 2 (onOnline) opens the offline page.
+            host.loadUrl(ONLINE_PAGE);
 
             MAIN.postDelayed(new Runnable() {
                 @Override
@@ -149,48 +152,18 @@ public final class SaveSync {
             }, CHECK_TIMEOUT_MS);
         }
 
-        private void download(String token) {
-            String save = null;
-            String problem = null;
-            HttpURLConnection connection = null;
-            try {
-                URL url = new URL(API + "/savedata/system/get?clientSessionId=" + randomId());
-                connection = (HttpURLConnection) url.openConnection();
-                connection.setConnectTimeout(15000);
-                connection.setReadTimeout(30000);
-                connection.setRequestProperty("Authorization", token);
-                connection.setRequestProperty("Content-Type", "application/json");
-                int code = connection.getResponseCode();
-                if (code == 200) {
-                    String body = readAll(connection.getInputStream());
-                    if (looksLikeSave(body)) {
-                        save = body;
-                    } else {
-                        problem = "The server reply was not a save.";
-                    }
-                } else if (code == 401 || code == 403) {
-                    problem = "Your online login expired. Open Online mode, log in again, then come back.";
-                } else {
-                    problem = "The online server returned " + code + ".";
-                }
-            } catch (IOException e) {
-                problem = "Could not reach the online server. Check your connection.";
-            } finally {
-                if (connection != null) {
-                    connection.disconnect();
-                }
+        /** Result of the online page's request. Status 0 means no login cookie, -1 a network failure. */
+        void onOnline(int status, String body) {
+            if (closed || fetchDone) {
+                return;
             }
-            final String finalSave = save;
-            final String finalProblem = problem;
-            MAIN.post(new Runnable() {
-                @Override
-                public void run() {
-                    onlineSave = finalSave;
-                    onlineProblem = finalProblem;
-                    fetchDone = true;
-                    compareWhenReady();
-                }
-            });
+            fetchDone = true;
+            if (status == 200 && looksLikeSave(body)) {
+                onlineSave = body;
+            } else {
+                onlineProblem = describeFailure(status, body);
+            }
+            host.loadUrl(HOST_PAGE);
         }
 
         void onHostReady() {
@@ -332,6 +305,16 @@ public final class SaveSync {
         }
 
         @JavascriptInterface
+        public void onOnline(final int status, final String body) {
+            MAIN.post(new Runnable() {
+                @Override
+                public void run() {
+                    session.onOnline(status, body);
+                }
+            });
+        }
+
+        @JavascriptInterface
         public void onReady() {
             MAIN.post(new Runnable() {
                 @Override
@@ -411,52 +394,71 @@ public final class SaveSync {
         }
     }
 
-    /** The login cookie the official site sets after logging in through Online mode. */
-    private static String sessionToken() {
-        String cookies = CookieManager.getInstance().getCookie(SITE);
-        if (cookies == null) {
-            return null;
-        }
-        String prefix = SESSION_COOKIE + "=";
-        for (String part : cookies.split(";")) {
-            String cookie = part.trim();
-            if (cookie.startsWith(prefix) && cookie.length() > prefix.length()) {
-                return cookie.substring(prefix.length());
-            }
-        }
-        return null;
-    }
-
     private static boolean looksLikeSave(String body) {
         String text = body.trim();
         return text.startsWith("{") && text.contains("\"dexData\"") && text.contains("\"timestamp\"");
     }
 
-    private static String readAll(InputStream in) throws IOException {
-        try {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buffer = new byte[16384];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                out.write(buffer, 0, read);
-            }
-            return out.toString("UTF-8");
-        } finally {
-            in.close();
+    private static String describeFailure(int status, String detail) {
+        switch (status) {
+            case 0:
+                return "You are not logged in online. Open Online mode in this app, log in, then come back.";
+            case -1:
+                return "Could not reach the online server (" + detail + ").";
+            case 200:
+                return "The server reply was not a save.";
+            case 401:
+                return "The server did not accept your login (401). Open Online mode, log out and back in, then try again.";
+            case 404:
+                return "This account has no online save yet.";
+            default:
+                return "The online server returned " + status + ".";
         }
-    }
-
-    private static String randomId() {
-        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        SecureRandom random = new SecureRandom();
-        StringBuilder id = new StringBuilder(32);
-        for (int i = 0; i < 32; i++) {
-            id.append(alphabet.charAt(random.nextInt(alphabet.length())));
-        }
-        return id.toString();
     }
 
     // ---- Page scripts ----
+
+    /**
+     * Hidden helper page, served on the official site's origin. It makes the same
+     * request the game makes for the save: the login cookie as the Authorization
+     * header, and a fresh client session id.
+     */
+    static final String ONLINE_HTML = String.join("\n",
+            "<!doctype html><meta charset=\"utf-8\"><script>",
+            "(function() {",
+            "  // Every value stored for the login cookie. A stale duplicate can sit next to",
+            "  // the live one, so each is tried until the server accepts one.",
+            "  function tokens(name) {",
+            "    var found = [];",
+            "    var parts = document.cookie.split(';');",
+            "    for (var i = 0; i < parts.length; i++) {",
+            "      var c = parts[i].trim();",
+            "      if (c.indexOf(name + '=') !== 0) { continue; }",
+            "      var value = c.slice(name.length + 1);",
+            "      if (value && found.indexOf(value) < 0) { found.push(value); }",
+            "    }",
+            "    return found;",
+            "  }",
+            "  var list = tokens('pokerogue_sessionId');",
+            "  if (!list.length) { saveSyncHost.onOnline(0, ''); return; }",
+            "  var alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';",
+            "  var id = '';",
+            "  for (var i = 0; i < 32; i++) { id += alphabet.charAt(Math.floor(Math.random() * alphabet.length)); }",
+            "  function attempt(index) {",
+            "    fetch('https://api.pokerogue.net/savedata/system/get?clientSessionId=' + id, {",
+            "      headers: { Authorization: list[index], 'Content-Type': 'application/json' }",
+            "    }).then(function(response) {",
+            "      return response.text().then(function(text) {",
+            "        if (response.status === 401 && index + 1 < list.length) { attempt(index + 1); return; }",
+            "        saveSyncHost.onOnline(response.status, response.ok ? text : '');",
+            "      });",
+            "    }).catch(function(e) {",
+            "      saveSyncHost.onOnline(-1, String((e && e.message) || e).slice(0, 120));",
+            "    });",
+            "  }",
+            "  attempt(0);",
+            "})();",
+            "</script>");
 
     /**
      * Hidden helper page, served on the offline game's origin so it shares that
@@ -539,6 +541,7 @@ public final class SaveSync {
             "    lines.push(((Date.now() - t0) / 1000).toFixed(1) + 's ' + text);",
             "    render();",
             "  }",
+            "  window.__importLogNote = function(text) { if (active) { log(String(text).slice(0, 140)); } };",
             "  var originalClick = HTMLInputElement.prototype.click;",
             "  HTMLInputElement.prototype.click = function() {",
             "    if (this.type === 'file') {",

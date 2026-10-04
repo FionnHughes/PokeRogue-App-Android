@@ -8,11 +8,15 @@ The Modern app's source is not public, so the fix is applied to its decoded code
      (the same script the legacy app injects, read from MainActivity.kt).
   2. The file picker shows all files instead of filtering on one MIME type,
      which can leave a .prsv greyed out.
-  3. Hooks call importfix.SaveSync (modern-patch/src), which the workflow
+  3. The activity's launch mode changes from singleInstance to singleTask.
+     Android cancels a file picker's result straight away when the app that
+     opened it is singleInstance, so the picked save never reached the game.
+  4. Hooks call importfix.SaveSync (modern-patch/src), which the workflow
      compiles and adds to the APK as classes3.dex. It adds a "Sync saves" entry
      to the drawer's Tools list and an on-screen log for the game's Import Data.
 """
 import re
+import struct
 import sys
 from pathlib import Path
 
@@ -25,6 +29,49 @@ TOOL = "Llabs/smarty/offlinerogue/viewmodel/Tool"
 # uses id 0, which no real resource has, and gets its label from code instead.
 SYNC_TITLE_ID = "0x0"
 SYNC_LABEL = "Sync saves"
+
+
+# Binary AndroidManifest.xml constants
+RES_XML_RESOURCE_MAP = 0x0180
+RES_XML_START_ELEMENT = 0x0102
+ATTR_LAUNCH_MODE = 0x0101001D
+LAUNCH_SINGLE_TASK = 2
+LAUNCH_SINGLE_INSTANCE = 3
+
+
+def patch_launch_mode(manifest: Path) -> None:
+    """Rewrite android:launchMode singleInstance -> singleTask in the binary manifest.
+
+    The manifest stays in its compiled form (apktool -r), so this edits the one
+    4-byte value in place and leaves every other byte untouched.
+    """
+    data = bytearray(manifest.read_bytes())
+    resource_ids = []
+    patched = 0
+    offset = 8  # skip the file header chunk
+    while offset < len(data):
+        chunk_type, header_size, chunk_size = struct.unpack_from("<HHI", data, offset)
+        if chunk_size < 8:
+            sys.exit("manifest: malformed chunk")
+        if chunk_type == RES_XML_RESOURCE_MAP:
+            count = (chunk_size - header_size) // 4
+            resource_ids = list(struct.unpack_from(f"<{count}I", data, offset + header_size))
+        elif chunk_type == RES_XML_START_ELEMENT:
+            body = offset + header_size
+            attr_start, attr_size, attr_count = struct.unpack_from("<HHH", data, body + 8)
+            for index in range(attr_count):
+                attr = body + attr_start + index * attr_size
+                name_index = struct.unpack_from("<I", data, attr + 4)[0]
+                if name_index < len(resource_ids) and resource_ids[name_index] == ATTR_LAUNCH_MODE:
+                    value = struct.unpack_from("<I", data, attr + 16)[0]
+                    if value != LAUNCH_SINGLE_INSTANCE:
+                        sys.exit(f"manifest: expected launchMode singleInstance, found {value}")
+                    struct.pack_into("<I", data, attr + 16, LAUNCH_SINGLE_TASK)
+                    patched += 1
+        offset += chunk_size
+    if patched != 1:
+        sys.exit(f"manifest: expected one launchMode attribute, patched {patched}")
+    manifest.write_bytes(data)
 
 
 def load_shim() -> str:
@@ -101,6 +148,24 @@ def main() -> None:
         + "    invoke-static {p2}, Limportfix/SaveSync;->attach(Landroid/webkit/WebView;)V\n"
     )
     text = replace_once(text, add_bridge, attach, "addJavascriptInterface call")
+
+    # Report what the file picker returned, for the on-screen import log. p1 is the Uri.
+    picker_result = (
+        "    iget-object v0, p0, Lkotlin/jvm/internal/Ref$ObjectRef;->element:Ljava/lang/Object;\n"
+        "\n"
+        "    const/4 v1, 0x0\n"
+        "\n"
+        "    if-nez v0, :cond_0\n"
+        "\n"
+        '    const-string p0, "chromeClient"\n'
+    )
+    text = replace_once(
+        text,
+        picker_result,
+        "    invoke-static {p1}, Limportfix/SaveSync;->onPickerResult(Landroid/net/Uri;)V\n\n"
+        + picker_result,
+        "file picker result handler",
+    )
     game_view.write_text(text)
 
     # Let the helper know the activity, so it can show its dialog.
@@ -121,7 +186,8 @@ def main() -> None:
     activity.write_text(text)
 
     patch_tools_list(root)
-    print("patched LocalWebViewClient, LocalWebChromeClient, GameViewKt, MainActivity and the Tools list")
+    patch_launch_mode(Path(sys.argv[1]) / "AndroidManifest.xml")
+    print("patched the launch mode, the web view hooks, MainActivity and the Tools list")
 
 
 def patch_tools_list(root: Path) -> None:

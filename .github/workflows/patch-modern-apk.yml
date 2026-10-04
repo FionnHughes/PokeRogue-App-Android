@@ -105,11 +105,21 @@ jobs:
           grep -qF '.method public static onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$helper"
           grep -qF '.method public static setActivity(Landroid/app/Activity;)V' "$helper"
           grep -qF '.method public static openMenu()V' "$helper"
+          grep -qF '.method public static onPickerResult(Landroid/net/Uri;)V' "$helper"
+          grep -qF 'Limportfix/SaveSync;->onPickerResult(Landroid/net/Uri;)V' "$sections/GameViewKt.smali"
           grep -qF 'Limportfix/SaveSync;->attach(Landroid/webkit/WebView;)V' "$sections/GameViewKt.smali"
           grep -qF 'Limportfix/SaveSync;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$sections/LocalWebViewClient.smali"
           grep -qF 'Limportfix/SaveSync;->openMenu()V' "$sections/ToolsSectionKt.smali"
           grep -qF 'Limportfix/SaveSync;->setActivity(Landroid/app/Activity;)V' verify/smali_classes2/labs/smarty/offlinerogue/MainActivity.smali
           echo "hooks and helper match"
+
+      - name: Check the launch mode change
+        run: |
+          # The patched manifest must differ from the original by exactly one byte.
+          cd work
+          changed=$(cmp -l <(unzip -p modern.apk AndroidManifest.xml) <(unzip -p ../OfflineRogue-Modern-importfix.apk AndroidManifest.xml) | wc -l)
+          echo "manifest bytes changed: $changed"
+          [ "$changed" = "1" ]
 
       - name: Publish as a draft release
         env:
