@@ -53,15 +53,36 @@ jobs:
           # -r keeps resources and the manifest untouched; only code is rebuilt
           java -jar apktool.jar d -r -f -o decoded modern.apk
           python3 ../scripts/patch_modern_apk.py decoded
-          java -jar apktool.jar b decoded -o unsigned/modern.apk
+          # With -r apktool cannot read minSdk from the manifest and would emit
+          # old-format dex files that Android refuses to load (crash on launch).
+          # The app's minSdk is 28, so build for that level.
+          java -jar apktool.jar b --api-level 28 decoded -o unsigned/modern.apk
+          # Only classes2.dex holds patched code; keep classes.dex byte-identical.
+          mkdir orig && unzip -q -o modern.apk classes.dex -d orig
+          (cd orig && zip -q -0 -X ../unsigned/modern.apk classes.dex)
           java -jar signer.jar -a unsigned/modern.apk --out signed
           cp signed/modern-aligned-debugSigned.apk ../OfflineRogue-Modern-importfix.apk
+
+      - name: Check the rebuilt code files match the original format
+        run: |
+          cd work
+          for dex in classes.dex classes2.dex; do
+            want=$(unzip -p modern.apk "$dex" | head -c 7 | od -An -c | tr -d ' \n')
+            got=$(unzip -p ../OfflineRogue-Modern-importfix.apk "$dex" | head -c 7 | od -An -c | tr -d ' \n')
+            echo "$dex: original=$want patched=$got"
+            [ "$want" = "$got" ] || { echo "dex format version changed"; exit 1; }
+          done
+          cmp <(unzip -p modern.apk classes.dex) <(unzip -p ../OfflineRogue-Modern-importfix.apk classes.dex)
 
       - name: Publish as a draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="modern-importfix-${GITHUB_SHA::7}"
+          # Remove earlier drafts of this build so only the newest one is offered
+          gh release list --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft and (.tagName | startswith("modern-importfix-"))) | .tagName' \
+            | while read -r old; do gh release delete "$old" --yes || true; done
           gh release create "$tag" OfflineRogue-Modern-importfix.apk \
             --draft \
             --target "$GITHUB_SHA" \
