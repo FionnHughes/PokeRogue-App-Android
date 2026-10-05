@@ -112,8 +112,9 @@ jobs:
           grep -qF 'Limportfix/SaveSync;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$sections/LocalWebViewClient.smali"
           grep -qF 'Limportfix/SaveSync;->onDrawerEntry(I)V' "$sections/ToolsSectionKt.smali"
           # The helper's scripts and name tables must be inside the APK.
-          unzip -l ../OfflineRogue-Modern-importfix.apk | grep -q 'assets/savesync/tables.js'
-          unzip -l ../OfflineRogue-Modern-importfix.apk | grep -q 'assets/savesync/starters.js'
+          for script in tables.js starters.js offline.js online.js; do
+            unzip -l ../OfflineRogue-Modern-importfix.apk | grep -q "assets/savesync/$script"
+          done
           grep -qF 'Limportfix/SaveSync;->setActivity(Landroid/app/Activity;)V' verify/smali_classes2/labs/smarty/offlinerogue/MainActivity.smali
           echo "hooks and helper match"
 
@@ -138,4 +139,4 @@ jobs:
             --draft \
             --target "$GITHUB_SHA" \
             --title "Modern app with import fix and online sync (private draft) ${GITHUB_SHA::7}" \
-            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix, Copy Pokemon caught, Sync saves and Restore backup entries in the drawer, and an on-screen import log patched in. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."
+            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix and three drawer entries patched in: Copy Pokemon caught, Sync saves (save data, run history and runs in progress, with a recommended sync and a step-by-step log) and Restore backup. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."

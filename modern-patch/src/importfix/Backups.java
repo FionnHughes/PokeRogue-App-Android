@@ -14,11 +14,13 @@ import java.util.List;
 /**
  * Keeps copies of what a sync or restore is about to replace, so it can be put back.
  *
- * One backup is up to three files in the app's private storage, named after when it
+ * One backup is up to four files in the app's private storage, named after when it
  * was taken and which side it came from ("offline" or "online"):
- *   id.meta.json     small description, shown in the restore list
- *   id.save.json     the save data, if the backup has any
- *   id.history.json  the run history, if the backup has any
+ *   id.meta.json      small description, shown in the restore list
+ *   id.save.json      the save data, if the backup has any
+ *   id.history.json   the run history, if the backup has any
+ *   id.sessions.json  the runs in progress, if the backup has any: a JSON array with
+ *                     one text per slot, "" for a slot the backup does not hold
  * Only the newest {@link #KEEP} backups are kept.
  */
 final class Backups {
@@ -26,6 +28,7 @@ final class Backups {
     static final String META = "meta";
     static final String SAVE = "save";
     static final String HISTORY = "history";
+    static final String SESSIONS = "sessions";
 
     private Backups() {
     }
@@ -35,7 +38,8 @@ final class Backups {
      *
      * @return the new backup's id, or null if it could not be stored (nothing is left behind)
      */
-    static synchronized String write(File dir, String origin, String meta, String save, String history) {
+    static synchronized String write(File dir, String origin, String meta, String save, String history,
+            String sessions) {
         if (!"offline".equals(origin) && !"online".equals(origin)) {
             return null; // the origin becomes part of a file name
         }
@@ -54,6 +58,9 @@ final class Backups {
             }
             if (history != null && !history.isEmpty()) {
                 writeText(file(dir, id, HISTORY), history);
+            }
+            if (sessions != null && !sessions.isEmpty()) {
+                writeText(file(dir, id, SESSIONS), sessions);
             }
             // The description goes last: a backup without one is not listed.
             writeText(file(dir, id, META), meta);
@@ -134,6 +141,7 @@ final class Backups {
         file(dir, id, META).delete();
         file(dir, id, SAVE).delete();
         file(dir, id, HISTORY).delete();
+        file(dir, id, SESSIONS).delete();
     }
 
     private static void writeText(File file, String text) throws IOException {
