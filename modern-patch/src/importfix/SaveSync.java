@@ -24,16 +24,20 @@ import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.text.DateFormat;
 import java.util.Date;
 
 /**
  * Save tools for the Modern app, opened from two entries in the drawer's Tools list.
  *
- * "Sync saves" compares the player's online save with the offline one (when each was
- * last saved, species caught, play time) and can copy either one over the other.
- * Copying offline to online is the same request the game makes when it saves, so the
- * official server applies its own checks and may refuse it.
+ * "Sync saves" compares the player's online and offline saves and run histories and
+ * can copy either way: both, the save data only, or the run history only.
+ * Copying save data offline to online is the same request the game makes when it
+ * saves, so the official server applies its own checks and may refuse it.
+ * Run history never touches the server: the game keeps it in the browser only, so
+ * "online run history" is what Online mode in this app has recorded. Copying it
+ * merges the two lists and keeps the newest runs.
  *
  * "Copy Pokémon caught" puts a text list of the Pokémon usable as starters on the
  * clipboard.
@@ -63,6 +67,13 @@ public final class SaveSync {
     private static final long CHECK_TIMEOUT_MS = 50000;
     private static final long APPLY_TIMEOUT_MS = 10000;
     private static final long UPLOAD_TIMEOUT_MS = 60000;
+    /** The passphrase the game itself uses for what it stores in the browser (its src/constants.ts). */
+    private static final String GAME_STORAGE_KEY = "x0i2O7WRiANTqPmZ";
+
+    /** What a copy includes. The values are passed to the helper page as they are. */
+    private static final String SCOPE_BOTH = "both";
+    private static final String SCOPE_SAVE = "save";
+    private static final String SCOPE_HISTORY = "history";
 
     private static final String NEWER_OFFLINE_WARNING =
             "Your offline save is newer.\n\n"
@@ -145,7 +156,14 @@ public final class SaveSync {
         private boolean closed;
         private String onlineSave;
         private String onlineProblem;
-        private String uploadText;
+        /** The account logged in online, "" if unknown. Its name is part of the run history's storage key. */
+        private String onlineUser = "";
+        /** The online run history as JSON text, "" if there is none. */
+        private String onlineHistory = "";
+        private String uploadSave;
+        private String uploadHistory;
+        /** What the copy in progress includes, for the message shown when it finishes. */
+        private String copied = "";
 
         Session(Activity activity, boolean copyStarters) {
             this.activity = activity;
@@ -206,8 +224,11 @@ public final class SaveSync {
                     new ByteArrayInputStream(new byte[0]));
         }
 
-        /** Result of the online page's request. Status 0 means no login cookie, -1 a network failure. */
-        void onOnline(int status, String body) {
+        /**
+         * Result of the online page's request. Status 0 means no login cookie, -1 a network
+         * failure. The run history arrives as the game stored it, encrypted.
+         */
+        void onOnline(int status, String body, String username, String storedHistory) {
             if (closed || fetchDone) {
                 return;
             }
@@ -216,6 +237,14 @@ public final class SaveSync {
                 onlineSave = body;
             } else {
                 onlineProblem = describeFailure(status, body);
+            }
+            onlineUser = username;
+            if (!storedHistory.isEmpty()) {
+                try {
+                    onlineHistory = CryptoJsAes.decrypt(storedHistory, GAME_STORAGE_KEY);
+                } catch (GeneralSecurityException e) {
+                    onlineHistory = ""; // unreadable: treated as no history
+                }
             }
             host.loadUrl(HOST_PAGE);
         }
@@ -227,7 +256,8 @@ public final class SaveSync {
             }
             compared = true;
             String argument = onlineSave == null ? "null" : JSONObject.quote(onlineSave);
-            host.evaluateJavascript("window.__sync.compare(" + argument + ");", null);
+            host.evaluateJavascript(
+                    "window.__sync.compare(" + argument + "," + JSONObject.quote(onlineHistory) + ");", null);
         }
 
         void onCompared(String json) {
@@ -236,10 +266,14 @@ public final class SaveSync {
             }
             JSONObject local;
             JSONObject online;
+            JSONObject localHistory;
+            JSONObject onlineHistorySummary;
             try {
                 JSONObject both = new JSONObject(json);
                 local = both.getJSONObject("local");
                 online = both.getJSONObject("online");
+                localHistory = both.getJSONObject("localHistory");
+                onlineHistorySummary = both.getJSONObject("onlineHistory");
             } catch (JSONException e) {
                 showDialog("Could not read the saves. Nothing was changed.", null, null, null, null);
                 return;
@@ -249,50 +283,86 @@ public final class SaveSync {
             if (copyStarters) {
                 offerStarterLists(local, online, localOk, onlineOk);
             } else {
-                offerSync(local, online, localOk, onlineOk);
+                offerSync(local, online, localOk, onlineOk, localHistory, onlineHistorySummary);
             }
         }
 
         // ---- Sync saves ----
 
-        private void offerSync(JSONObject local, JSONObject online, boolean localOk, boolean onlineOk) {
+        private void offerSync(JSONObject local, JSONObject online, boolean localOk, boolean onlineOk,
+                JSONObject localHistory, JSONObject onlineHistorySummary) {
+            // Online run history needs the account name, so it is only known when logged in.
+            boolean historyKnown = !onlineUser.isEmpty();
+            int localRuns = localHistory.optInt("runs");
+            int onlineRuns = onlineHistorySummary.optInt("runs");
+
             StringBuilder message = new StringBuilder();
-            message.append("ONLINE SAVE\n");
+            message.append("ONLINE\n");
             message.append(onlineProblem != null ? onlineProblem : describe(online));
-            message.append("\n\nOFFLINE SAVE\n").append(describe(local));
+            if (historyKnown) {
+                message.append("\n").append(describeHistory(onlineHistorySummary, "offline"));
+            }
+            message.append("\n\nOFFLINE\n").append(describe(local));
+            message.append("\n").append(describeHistory(localHistory, historyKnown ? "online" : null));
             if (onlineOk) {
                 message.append("\n\n").append(verdict(local, online, localOk));
+            }
+            if (historyKnown) {
+                message.append("\n\nOnline run history is only what Online mode in this app has recorded.");
             }
 
             final boolean offlineNewer = onlineOk && localOk
                     && local.optLong("timestamp") > online.optLong("timestamp");
-            final Runnable toOffline = new Runnable() {
+            // Each direction lists only what it can actually copy.
+            final String[] downloadScopes = scopes(onlineOk, historyKnown && onlineRuns > 0);
+            final String[] uploadScopes = scopes(onlineOk && localOk, historyKnown && localRuns > 0);
+
+            Runnable download = new Runnable() {
                 @Override
                 public void run() {
-                    host.evaluateJavascript("window.__sync.apply();", null);
-                    closeAfter(APPLY_TIMEOUT_MS);
-                }
-            };
-            Runnable download = !offlineNewer ? toOffline : new Runnable() {
-                @Override
-                public void run() {
-                    showDialog(NEWER_OFFLINE_WARNING, "Replace offline save", toOffline, null, null);
+                    chooseScope("Copy online to offline", downloadScopes, new ScopeAction() {
+                        @Override
+                        public void run(final String scope) {
+                            final Runnable copy = new Runnable() {
+                                @Override
+                                public void run() {
+                                    copied = scopeName(scope);
+                                    host.evaluateJavascript("window.__sync.apply('" + scope + "');", null);
+                                    closeAfter(APPLY_TIMEOUT_MS);
+                                }
+                            };
+                            if (offlineNewer && !SCOPE_HISTORY.equals(scope)) {
+                                showDialog(NEWER_OFFLINE_WARNING, "Replace offline save", copy, null, null);
+                            } else {
+                                copy.run();
+                            }
+                        }
+                    });
                 }
             };
             Runnable upload = new Runnable() {
                 @Override
                 public void run() {
-                    showDialog(UPLOAD_WARNING, "Replace online save", new Runnable() {
+                    chooseScope("Copy offline to online", uploadScopes, new ScopeAction() {
                         @Override
-                        public void run() {
-                            startUpload();
+                        public void run(final String scope) {
+                            if (SCOPE_HISTORY.equals(scope)) {
+                                startUpload(scope); // stays in this app's browser storage: nothing to warn about
+                                return;
+                            }
+                            showDialog(UPLOAD_WARNING, "Replace online save", new Runnable() {
+                                @Override
+                                public void run() {
+                                    startUpload(scope);
+                                }
+                            }, null, null);
                         }
-                    }, null, null);
+                    });
                 }
             };
             showDialog(message.toString(),
-                    onlineOk ? "Copy online to offline" : null, download,
-                    onlineOk && localOk ? "Copy offline to online" : null, upload);
+                    downloadScopes.length > 0 ? "Copy online to offline" : null, download,
+                    uploadScopes.length > 0 ? "Copy offline to online" : null, upload);
         }
 
         void onApplied(boolean ok, String problem) {
@@ -300,19 +370,20 @@ public final class SaveSync {
                 return;
             }
             if (!ok) {
-                showDialog("Could not store the save. Nothing was changed.\n" + problem, null, null, null, null);
+                showDialog("Could not store the copy. Nothing was changed.\n" + problem, null, null, null, null);
                 return;
             }
-            Toast.makeText(activity, "Offline save replaced with your online save", Toast.LENGTH_LONG).show();
-            reloadGameOn(OFFLINE_HOST); // a running offline game still holds the old save in memory
+            Toast.makeText(activity, "Copied " + copied + " from online to offline", Toast.LENGTH_LONG).show();
+            reloadGameOn(OFFLINE_HOST); // a running offline game still holds the old data in memory
             close();
         }
 
-        /** Upload, step 1: read the offline save. Steps 2 and 3 follow in onLocalRaw and onUploadReady. */
-        private void startUpload() {
+        /** Upload, step 1: read the offline side. Steps 2 and 3 follow in onLocalRaw and onUploadReady. */
+        private void startUpload(String scope) {
             uploading = true;
-            showDialog("Uploading your offline save...", null, null, null, null);
-            host.evaluateJavascript("window.__sync.readLocal();", null);
+            copied = scopeName(scope);
+            showDialog("Copying offline to online...", null, null, null, null);
+            host.evaluateJavascript("window.__sync.prepareUpload('" + scope + "');", null);
             MAIN.postDelayed(new Runnable() {
                 @Override
                 public void run() {
@@ -325,24 +396,39 @@ public final class SaveSync {
             }, UPLOAD_TIMEOUT_MS);
         }
 
-        void onLocalRaw(String text) {
+        /**
+         * Upload, step 2. Either text is "" when the chosen scope leaves it out. The run
+         * history arrives already merged with the online one and is stored encrypted,
+         * the way the online game keeps it.
+         */
+        void onLocalRaw(boolean ok, String save, String mergedHistory) {
             if (closed || !uploading) {
                 return;
             }
-            if (text.isEmpty()) {
+            String storedHistory = "";
+            if (ok && !mergedHistory.isEmpty()) {
+                try {
+                    storedHistory = CryptoJsAes.encrypt(mergedHistory, GAME_STORAGE_KEY);
+                } catch (GeneralSecurityException e) {
+                    ok = false;
+                }
+            }
+            if (!ok) {
                 uploading = false;
-                showDialog("The offline save could not be read. Nothing was changed.", null, null, null, null);
+                showDialog("The offline data could not be read. Nothing was changed.", null, null, null, null);
                 return;
             }
-            uploadText = text;
+            uploadSave = save;
+            uploadHistory = storedHistory;
             host.loadUrl(UPLOAD_PAGE);
         }
 
         void onUploadReady() {
-            if (closed || !uploading || uploadText == null) {
+            if (closed || !uploading || uploadSave == null) {
                 return;
             }
-            host.evaluateJavascript("window.__online.upload(" + JSONObject.quote(uploadText) + ");", null);
+            host.evaluateJavascript("window.__online.upload(" + JSONObject.quote(uploadSave) + ","
+                    + JSONObject.quote(onlineUser) + "," + JSONObject.quote(uploadHistory) + ");", null);
         }
 
         void onUploaded(int status, String body) {
@@ -351,8 +437,8 @@ public final class SaveSync {
             }
             uploading = false;
             if (status >= 200 && status < 300) {
-                Toast.makeText(activity, "Online save replaced with your offline save", Toast.LENGTH_LONG).show();
-                reloadGameOn(ONLINE_HOST); // a running online game still holds the old save in memory
+                Toast.makeText(activity, "Copied " + copied + " from offline to online", Toast.LENGTH_LONG).show();
+                reloadGameOn(ONLINE_HOST); // a running online game still holds the old data in memory
                 close();
                 return;
             }
@@ -457,6 +543,49 @@ public final class SaveSync {
             }
         }
 
+        /**
+         * Asks what a copy should include. Follows the same rule as showDialog: picking an
+         * entry keeps the session open, closing the list any other way ends it.
+         */
+        private void chooseScope(String heading, final String[] scopes, final ScopeAction action) {
+            if (closed || activity.isFinishing()) {
+                close();
+                return;
+            }
+            String[] labels = new String[scopes.length];
+            for (int i = 0; i < scopes.length; i++) {
+                String name = scopeName(scopes[i]);
+                labels[i] = Character.toUpperCase(name.charAt(0)) + name.substring(1)
+                        + (SCOPE_BOTH.equals(scopes[i]) ? "" : " only");
+            }
+            final AlertDialog previous = dialog;
+            final boolean[] acted = {false};
+            final AlertDialog next = new AlertDialog.Builder(activity)
+                    .setTitle(heading)
+                    .setItems(labels, new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int which) {
+                            acted[0] = true;
+                            action.run(scopes[which]);
+                        }
+                    })
+                    .setNegativeButton("Cancel", null)
+                    .create();
+            next.setOnDismissListener(new DialogInterface.OnDismissListener() {
+                @Override
+                public void onDismiss(DialogInterface d) {
+                    if (dialog == next && !acted[0]) {
+                        close();
+                    }
+                }
+            });
+            dialog = next;
+            next.show();
+            if (previous != null) {
+                previous.dismiss();
+            }
+        }
+
         /** Never leave the session open if the helper page does not answer. */
         private void closeAfter(long delayMs) {
             MAIN.postDelayed(new Runnable() {
@@ -492,6 +621,26 @@ public final class SaveSync {
         }
     }
 
+    private interface ScopeAction {
+        void run(String scope);
+    }
+
+    private static String scopeName(String scope) {
+        return SCOPE_BOTH.equals(scope) ? "save data and run history"
+                : SCOPE_SAVE.equals(scope) ? "save data" : "run history";
+    }
+
+    /** The scopes a direction can offer, given whether it has save data and run history to copy. */
+    private static String[] scopes(boolean save, boolean history) {
+        if (save && history) {
+            return new String[] {SCOPE_BOTH, SCOPE_SAVE, SCOPE_HISTORY};
+        }
+        if (save) {
+            return new String[] {SCOPE_SAVE};
+        }
+        return history ? new String[] {SCOPE_HISTORY} : new String[0];
+    }
+
     /** Receives results from the hidden helper pages. Calls arrive on a WebView thread. */
     private static final class HostBridge {
         private final Session session;
@@ -501,11 +650,12 @@ public final class SaveSync {
         }
 
         @JavascriptInterface
-        public void onOnline(final int status, final String body) {
+        public void onOnline(final int status, final String body, final String username,
+                final String storedHistory) {
             MAIN.post(new Runnable() {
                 @Override
                 public void run() {
-                    session.onOnline(status, body);
+                    session.onOnline(status, body, username, storedHistory);
                 }
             });
         }
@@ -541,11 +691,11 @@ public final class SaveSync {
         }
 
         @JavascriptInterface
-        public void onLocalRaw(final String text) {
+        public void onLocalRaw(final boolean ok, final String save, final String mergedHistory) {
             MAIN.post(new Runnable() {
                 @Override
                 public void run() {
-                    session.onLocalRaw(text);
+                    session.onLocalRaw(ok, save, mergedHistory);
                 }
             });
         }
@@ -615,6 +765,20 @@ public final class SaveSync {
         return starters + " Pokémon usable as starters";
     }
 
+    /** One line about a run history. `other` names the side it is compared with, or null for no comparison. */
+    private static String describeHistory(JSONObject summary, String other) {
+        int runs = summary.optInt("runs");
+        if (runs == 0) {
+            return "Run history: none";
+        }
+        String line = "Run history: " + runs + (runs == 1 ? " run" : " runs");
+        int extra = summary.optInt("notInOther");
+        if (other != null && extra > 0) {
+            line += " (" + extra + " not in " + other + ")";
+        }
+        return line;
+    }
+
     private static String verdict(JSONObject local, JSONObject online, boolean localOk) {
         if (!localOk) {
             return "There is no offline save to lose.";
@@ -670,6 +834,10 @@ public final class SaveSync {
             return "The connection failed during the upload (" + detail
                     + "). Check your online save before trying again.";
         }
+        if (status == -2) {
+            return "The run history could not be stored for the online game (" + detail
+                    + "). Save data, if it was part of the copy, did go through.";
+        }
         String reason;
         if (status == 0) {
             reason = "You are not logged in online. Open Online mode in this app, log in, then come back.";
@@ -693,14 +861,18 @@ public final class SaveSync {
     /**
      * Hidden helper page, served on the official site's origin. It makes the same
      * requests the game makes: the login cookie as the Authorization header and a
-     * fresh client session id. Loaded plain it fetches the save; loaded with
-     * "?upload" it waits for a save to send, fetches first (the server only takes
-     * an update from the session that last fetched), then posts the update.
+     * fresh client session id. Loaded plain it fetches the save, the account name and
+     * that account's stored run history. Loaded with "?upload" it waits for data to
+     * send: a save is posted to the server (after a fetch, because the server only
+     * takes an update from the session that last fetched), and a run history is
+     * written to this origin's localStorage, where the online game keeps it.
      */
     static final String ONLINE_HTML = String.join("\n",
             "<!doctype html><meta charset=\"utf-8\"><script>",
             "(function() {",
-            "  var API = 'https://api.pokerogue.net/savedata/system/';",
+            "  var ROOT = 'https://api.pokerogue.net/';",
+            "  var API = ROOT + 'savedata/system/';",
+            "  var HISTORY_PREFIX = 'runHistoryData_';",
             "  // Every value stored for the login cookie. A stale duplicate can sit next to",
             "  // the live one, so each is tried until the server accepts one.",
             "  function tokens(name) {",
@@ -720,46 +892,84 @@ public final class SaveSync {
             "  for (var i = 0; i < 32; i++) { id += alphabet.charAt(Math.floor(Math.random() * alphabet.length)); }",
             "  function headers(index) { return { Authorization: list[index], 'Content-Type': 'application/json' }; }",
             "  function problem(e) { return String((e && e.message) || e).slice(0, 120); }",
+            "  // The account name is part of the run history's storage key. If the server",
+            "  // does not say who is logged in, a single stored history is taken to be theirs.",
+            "  function onlyStoredUser() {",
+            "    var names = [];",
+            "    for (var i = 0; i < localStorage.length; i++) {",
+            "      var key = localStorage.key(i);",
+            "      if (key.indexOf(HISTORY_PREFIX) === 0 && key !== HISTORY_PREFIX + 'Guest') { names.push(key.slice(HISTORY_PREFIX.length)); }",
+            "    }",
+            "    return names.length === 1 ? names[0] : '';",
+            "  }",
+            "  function whoAmI(index) {",
+            "    return fetch(ROOT + 'account/info', { headers: headers(index) })",
+            "      .then(function(response) { return response.ok ? response.json() : null; })",
+            "      .then(function(info) { return (info && info.username) || onlyStoredUser(); })",
+            "      .catch(function() { return onlyStoredUser(); });",
+            "  }",
+            "  function report(status, text, username) {",
+            "    var history = '';",
+            "    try { if (username) { history = localStorage.getItem(HISTORY_PREFIX + username) || ''; } } catch (e) {}",
+            "    saveSyncHost.onOnline(status, text, username || '', history);",
+            "  }",
             "  function fetchSave(index) {",
             "    fetch(API + 'get?clientSessionId=' + id, { headers: headers(index) }).then(function(response) {",
             "      return response.text().then(function(text) {",
             "        if (response.status === 401 && index + 1 < list.length) { fetchSave(index + 1); return; }",
-            "        saveSyncHost.onOnline(response.status, response.ok ? text : '');",
+            "        if (response.status === 401) { report(401, '', ''); return; }",
+            "        return whoAmI(index).then(function(username) { report(response.status, response.ok ? text : '', username); });",
             "      });",
-            "    }).catch(function(e) { saveSyncHost.onOnline(-1, problem(e)); });",
+            "    }).catch(function(e) { report(-1, problem(e), ''); });",
             "  }",
-            "  function sendSave(index, save) {",
+            "  function sendSave(index, save, afterwards) {",
             "    fetch(API + 'get?clientSessionId=' + id, { headers: headers(index) }).then(function(got) {",
-            "      if (got.status === 401 && index + 1 < list.length) { sendSave(index + 1, save); return; }",
+            "      if (got.status === 401 && index + 1 < list.length) { sendSave(index + 1, save, afterwards); return; }",
             "      if (!got.ok) {",
             "        return got.text().then(function(text) { saveSyncHost.onUploaded(got.status, text.trim().slice(0, 200)); });",
             "      }",
             "      return fetch(API + 'update?clientSessionId=' + id, {",
             "        method: 'POST', headers: headers(index), body: save",
             "      }).then(function(put) {",
-            "        return put.text().then(function(text) { saveSyncHost.onUploaded(put.status, text.trim().slice(0, 200)); });",
+            "        return put.text().then(function(text) {",
+            "          if (put.ok) {",
+            "            try { afterwards(); } catch (e) { saveSyncHost.onUploaded(-2, problem(e)); return; }",
+            "          }",
+            "          saveSyncHost.onUploaded(put.status, text.trim().slice(0, 200));",
+            "        });",
             "      });",
             "    }).catch(function(e) { saveSyncHost.onUploaded(-1, problem(e)); });",
             "  }",
             "  if (location.search === '?upload') {",
             "    window.__online = {",
-            "      upload: function(save) {",
+            "      // save: text to post, or '' for none. storedHistory: run history as the game",
+            "      // stores it, or '' for none; it is only written once the save has gone through.",
+            "      upload: function(save, username, storedHistory) {",
+            "        function writeHistory() {",
+            "          if (storedHistory && username) { localStorage.setItem(HISTORY_PREFIX + username, storedHistory); }",
+            "        }",
+            "        if (!save) {",
+            "          try { writeHistory(); saveSyncHost.onUploaded(204, ''); }",
+            "          catch (e) { saveSyncHost.onUploaded(-2, problem(e)); }",
+            "          return;",
+            "        }",
             "        if (!list.length) { saveSyncHost.onUploaded(0, ''); return; }",
-            "        sendSave(0, save);",
+            "        sendSave(0, save, writeHistory);",
             "      }",
             "    };",
             "    saveSyncHost.onUploadReady();",
             "    return;",
             "  }",
-            "  if (!list.length) { saveSyncHost.onOnline(0, ''); return; }",
+            "  if (!list.length) { report(0, '', ''); return; }",
             "  fetchSave(0);",
             "})();",
             "</script>");
 
     /**
      * Hidden helper page, served on the offline game's origin so it shares that
-     * game's localStorage. The offline game keeps its save under "data_Guest" as
-     * btoa(encodeURIComponent(json)). The two asset scripts add the starter list.
+     * game's localStorage. The offline game keeps its save under "data_Guest" and its
+     * run history under "runHistoryData_Guest", both as btoa(encodeURIComponent(json)).
+     * The two asset scripts add the starter list.
      */
     static final String HOST_HTML = String.join("\n",
             "<!doctype html><meta charset=\"utf-8\">",
@@ -768,10 +978,20 @@ public final class SaveSync {
             "<script>",
             "(function() {",
             "  var KEY = 'data_Guest';",
+            "  var HISTORY_KEY = 'runHistoryData_Guest';",
+            "  var HISTORY_LIMIT = 25; // the game's own cap on stored runs",
             "  var online = null;",
+            "  var onlineHistory = '';",
+            "  function read(key) {",
+            "    var v = localStorage.getItem(key);",
+            "    return v ? decodeURIComponent(atob(v)) : null;",
+            "  }",
+            "  function store(key, text) { localStorage.setItem(key, btoa(encodeURIComponent(text))); }",
             "  function readLocal() {",
-            "    try { var v = localStorage.getItem(KEY); return v ? decodeURIComponent(atob(v)) : null; }",
-            "    catch (e) { return '{broken'; }",
+            "    try { return read(KEY); } catch (e) { return '{broken'; }",
+            "  }",
+            "  function readLocalHistory() {",
+            "    try { return read(HISTORY_KEY) || ''; } catch (e) { return ''; }",
             "  }",
             "  function summarize(text) {",
             "    if (!text) { return { exists: false }; }",
@@ -792,23 +1012,70 @@ public final class SaveSync {
             "      };",
             "    } catch (e) { return { exists: true, broken: true }; }",
             "  }",
+            "  // A run history is an object of runs keyed by the time each run ended.",
+            "  function runs(text) {",
+            "    try {",
+            "      var parsed = text ? JSON.parse(text) : {};",
+            "      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};",
+            "    } catch (e) { return {}; }",
+            "  }",
+            "  function summarizeHistory(text, otherText) {",
+            "    var mine = runs(text);",
+            "    var other = runs(otherText);",
+            "    var keys = Object.keys(mine);",
+            "    return {",
+            "      runs: keys.length,",
+            "      notInOther: keys.filter(function(k) { return !(k in other); }).length",
+            "    };",
+            "  }",
+            "  // Adds the source's runs to the target's and keeps the newest ones.",
+            "  function mergeHistory(sourceText, targetText) {",
+            "    var merged = runs(targetText);",
+            "    var source = runs(sourceText);",
+            "    Object.keys(source).forEach(function(k) { merged[k] = source[k]; });",
+            "    var kept = {};",
+            "    Object.keys(merged)",
+            "      .sort(function(a, b) { return Number(b) - Number(a); })",
+            "      .slice(0, HISTORY_LIMIT)",
+            "      .forEach(function(k) { kept[k] = merged[k]; });",
+            "    return JSON.stringify(kept);",
+            "  }",
             "  window.__sync = {",
-            "    compare: function(onlineText) {",
+            "    compare: function(onlineText, onlineHistoryText) {",
             "      online = onlineText;",
-            "      saveSyncHost.onCompared(JSON.stringify({ local: summarize(readLocal()), online: summarize(onlineText) }));",
+            "      onlineHistory = onlineHistoryText || '';",
+            "      var localHistory = readLocalHistory();",
+            "      saveSyncHost.onCompared(JSON.stringify({",
+            "        local: summarize(readLocal()),",
+            "        online: summarize(onlineText),",
+            "        localHistory: summarizeHistory(localHistory, onlineHistory),",
+            "        onlineHistory: summarizeHistory(onlineHistory, localHistory)",
+            "      }));",
             "    },",
-            "    apply: function() {",
+            "    // scope: 'both', 'save' or 'history'. Online to offline.",
+            "    apply: function(scope) {",
             "      try {",
-            "        if (!online) { throw new Error('no online save loaded'); }",
-            "        JSON.parse(online);",
-            "        localStorage.setItem(KEY, btoa(encodeURIComponent(online)));",
+            "        if (scope !== 'history') {",
+            "          if (!online) { throw new Error('no online save loaded'); }",
+            "          JSON.parse(online);",
+            "          store(KEY, online);",
+            "        }",
+            "        if (scope !== 'save') { store(HISTORY_KEY, mergeHistory(onlineHistory, readLocalHistory())); }",
             "        saveSyncHost.onApplied(true, '');",
             "      } catch (e) { saveSyncHost.onApplied(false, String((e && e.message) || e)); }",
             "    },",
-            "    readLocal: function() {",
-            "      var text = readLocal();",
-            "      try { JSON.parse(text); } catch (e) { text = ''; }",
-            "      saveSyncHost.onLocalRaw(text || '');",
+            "    // Offline to online: hands over what the scope includes, '' for what it leaves out.",
+            "    prepareUpload: function(scope) {",
+            "      try {",
+            "        var save = '';",
+            "        if (scope !== 'history') {",
+            "          save = readLocal();",
+            "          if (!save) { throw new Error('there is no offline save'); }",
+            "          JSON.parse(save);",
+            "        }",
+            "        var history = scope !== 'save' ? mergeHistory(readLocalHistory(), onlineHistory) : '';",
+            "        saveSyncHost.onLocalRaw(true, save, history);",
+            "      } catch (e) { saveSyncHost.onLocalRaw(false, '', ''); }",
             "    },",
             "    starters: function(which) {",
             "      try {",
