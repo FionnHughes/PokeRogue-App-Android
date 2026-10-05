@@ -1,8 +1,8 @@
 name: Patch Modern APK
 
 # Rebuilds the Modern (PodarSmarty) app with the save-import fix applied, a
-# "Copy Pokémon caught" and "Sync saves" entries added to the drawer, and an
-# on-screen log for Import Data.
+# "Copy Pokémon caught", "Sync saves" and "Restore backup" entries added to the
+# drawer, and an on-screen log for Import Data.
 # The result is published as a DRAFT release: only people with write access to
 # this repository can see or download it. That app is closed-source, so the
 # patched copy is for personal testing and is not redistributed publicly.
@@ -138,4 +138,4 @@ jobs:
             --draft \
             --target "$GITHUB_SHA" \
             --title "Modern app with import fix and online sync (private draft) ${GITHUB_SHA::7}" \
-            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix, Copy Pokemon caught and Sync saves entries in the drawer, and an on-screen import log patched in. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."
+            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix, Copy Pokemon caught, Sync saves and Restore backup entries in the drawer, and an on-screen import log patched in. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."

@@ -12,9 +12,9 @@ The Modern app's source is not public, so the fix is applied to its decoded code
      Android cancels a file picker's result straight away when the app that
      opened it is singleInstance, so the picked save never reached the game.
   4. Hooks call importfix.SaveSync (modern-patch/src), which the workflow
-     compiles and adds to the APK as classes3.dex. It adds "Copy Pokémon caught"
-     and "Sync saves" entries to the drawer's Tools list and an on-screen log
-     for the game's Import Data. Its scripts and name tables are copied into
+     compiles and adds to the APK as classes3.dex. It adds "Copy Pokémon caught",
+     "Sync saves" and "Restore backup" entries to the drawer's Tools list and an
+     on-screen log for the game's Import Data. Its scripts and name tables are copied into
      the APK's assets/savesync folder.
 """
 import re
@@ -30,13 +30,15 @@ SECTIONS = APP + "/ui/composable/sections"
 TOOL = "Llabs/smarty/offlinerogue/viewmodel/Tool"
 ASSETS = REPO / "modern-patch/assets/savesync"
 # The drawer's Tools list holds a string resource id per entry. The added entries
-# use ids 0 and 1, which no real resource has, and get their labels from code.
-# SaveSync.onDrawerEntry receives the same numbers.
-SYNC_TITLE_ID = "0x0"
-SYNC_LABEL = "Sync saves"
-COPY_TITLE_ID = "0x1"
-COPY_LABEL = "Copy Pok\\u00e9mon caught"  # smali escape for é
-
+# use small numbers no real resource has, and get their labels from code.
+# SaveSync.onDrawerEntry receives the same numbers. Listed in drawer order;
+# labels are smali string literals (\\u00e9 is é).
+DRAWER_ENTRIES = [
+    (1, "Copy Pok\\u00e9mon caught", "savesync://starters"),
+    (0, "Sync saves", "savesync://menu"),
+    (2, "Restore backup", "savesync://restore"),
+]
+ORIGINAL_TOOLS = 6
 
 # Binary AndroidManifest.xml constants
 RES_XML_RESOURCE_MAP = 0x0180
@@ -199,11 +201,11 @@ def main() -> None:
 
 
 def patch_tools_list(root: Path) -> None:
-    """Add "Copy Pokémon caught" and "Sync saves" at the end of the drawer's Tools list."""
+    """Add this patch's entries at the end of the drawer's Tools list."""
     tools = root / "ToolsSectionKt.smali"
     text = tools.read_text()
 
-    # 1. Two more elements in the static list.
+    # 1. More elements in the static list.
     array_start = (
         "    const/4 v0, 0x6\n"
         "\n"
@@ -211,7 +213,7 @@ def patch_tools_list(root: Path) -> None:
         f"    new-array v0, v0, [{TOOL};\n"
     )
     text = replace_once(
-        text, array_start, array_start.replace("const/4 v0, 0x6", "const/16 v0, 0x8"), "Tools array size"
+        text, array_start, array_start.replace("const/4 v0, 0x6", f"const/16 v0, {hex(ORIGINAL_TOOLS + len(DRAWER_ENTRIES))}"), "Tools array size"
     )
     last_entry = (
         "    const/4 v2, 0x5\n"
@@ -219,18 +221,18 @@ def patch_tools_list(root: Path) -> None:
         "    aput-object v1, v0, v2\n"
     )
     sync_entry = last_entry
-    for index, title_id, url in ((6, COPY_TITLE_ID, "savesync://starters"), (7, SYNC_TITLE_ID, "savesync://menu")):
+    for offset, (title_id, _label, url) in enumerate(DRAWER_ENTRIES):
         sync_entry += (
             "\n"
             + f"    new-instance v1, {TOOL}$Website;\n"
             + "\n"
-            + f"    const/4 v2, {title_id}\n"
+            + f"    const/4 v2, {hex(title_id)}\n"
             + "\n"
             + f'    const-string v3, "{url}"\n'
             + "\n"
             + f"    invoke-direct {{v1, v2, v3}}, {TOOL}$Website;-><init>(ILjava/lang/String;)V\n"
             + "\n"
-            + f"    const/4 v2, {hex(index)}\n"
+            + f"    const/16 v2, {hex(ORIGINAL_TOOLS + offset)}\n"
             + "\n"
             + "    aput-object v1, v0, v2\n"
         )
@@ -238,7 +240,7 @@ def patch_tools_list(root: Path) -> None:
 
     # 2. A tap on either entry closes the drawer and opens its dialog instead of
     #    the tool sheet. p1 is the tapped Tool, p2 the "close drawer" callback.
-    #    Real title ids are large resource ids, so "at most 1" means one of ours.
+    #    Real title ids are large resource ids, so a small number means one of ours.
     open_tool = (
         "    invoke-virtual {p0, p1}, Llabs/smarty/offlinerogue/viewmodel/DrawerViewModel;->"
         f"setBottomSheetTool({TOOL};)V\n"
@@ -248,7 +250,7 @@ def patch_tools_list(root: Path) -> None:
         "\n"
         "    move-result v0\n"
         "\n"
-        "    const/4 v1, 0x1\n"
+        f"    const/4 v1, {hex(max(entry[0] for entry in DRAWER_ENTRIES))}\n"
         "\n"
         "    if-gt v0, v1, :not_save_tool\n"
         "\n"
@@ -265,7 +267,8 @@ def patch_tools_list(root: Path) -> None:
     text = replace_once(text, open_tool, open_sync, "tool tap handler")
     tools.write_text(text)
 
-    # 3. The entries' labels: ids 0 and 1 are ours; every other id is looked up as before.
+    # 3. The entries' labels: our ids get their text here; every other id is looked up as before.
+    #    v1 holds the title id and v3 receives the label; v3 doubles as scratch for the comparison.
     label = root / "ToolsSectionKt$ToolsSection$1$1.smali"
     text = label.read_text()
     lookup = (
@@ -274,27 +277,20 @@ def patch_tools_list(root: Path) -> None:
         "\n"
         "    move-result-object v3\n"
     )
-    with_sync_label = (
-        "    if-nez v1, :save_tool_not_sync\n"
-        "\n"
-        f'    const-string v3, "{SYNC_LABEL}"\n'
-        "\n"
-        "    goto :save_tool_label_done\n"
-        "\n"
-        "    :save_tool_not_sync\n"
-        "    const/4 v3, 0x1\n"
-        "\n"
-        "    if-ne v1, v3, :save_tool_lookup\n"
-        "\n"
-        f'    const-string v3, "{COPY_LABEL}"\n'
-        "\n"
-        "    goto :save_tool_label_done\n"
-        "\n"
-        "    :save_tool_lookup\n"
-        + lookup
-        + "\n"
-        + "    :save_tool_label_done\n"
-    )
+    with_sync_label = ""
+    for title_id, entry_label, _url in DRAWER_ENTRIES:
+        with_sync_label += (
+            f"    const/4 v3, {hex(title_id)}\n"
+            "\n"
+            f"    if-ne v1, v3, :save_tool_not_{title_id}\n"
+            "\n"
+            f'    const-string v3, "{entry_label}"\n'
+            "\n"
+            "    goto :save_tool_label_done\n"
+            "\n"
+            f"    :save_tool_not_{title_id}\n"
+        )
+    with_sync_label += lookup + "\n" + "    :save_tool_label_done\n"
     text = replace_once(text, lookup, with_sync_label, "tool label lookup")
     label.write_text(text)
 
