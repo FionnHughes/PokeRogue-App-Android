@@ -52,6 +52,10 @@ import java.util.Locale;
  * refuse. Run history never touches the server: the game keeps it in the browser
  * only, so "online run history" is what Online mode in this app has recorded.
  *
+ * The same comparison runs by itself, without showing anything, each time a game
+ * starts. If the other side is ahead of the game being started, it says so and
+ * offers to sync first.
+ *
  * "Copy Pokémon caught" puts a text list of the Pokémon usable as starters on the
  * clipboard.
  *
@@ -135,6 +139,9 @@ public final class SaveSync {
     private static Session current;
     /** The client session id the online game last used with the server, "" if none was seen. */
     private static volatile String gameClientId = "";
+    /** Whether the check at a game's start has run for the current game WebView. Main thread only. */
+    private static boolean checkedOffline;
+    private static boolean checkedOnline;
 
     private SaveSync() {
     }
@@ -150,6 +157,8 @@ public final class SaveSync {
     public static void attach(WebView gameWebView) {
         gameRef = new WeakReference<WebView>(gameWebView);
         gameWebView.addJavascriptInterface(new GameBridge(), "saveSyncGame");
+        checkedOffline = false;
+        checkedOnline = false;
     }
 
     /** Hook: the game WebView's onPageFinished. */
@@ -157,6 +166,7 @@ public final class SaveSync {
         String host = hostOf(url);
         if (host.equals(OFFLINE_HOST)) {
             view.evaluateJavascript(IMPORT_LOG_JS, null);
+            checkAtStart(OFFLINE_HOST);
         } else if (host.equals(ONLINE_HOST)) {
             view.evaluateJavascript(CLIENT_ID_JS, null);
         }
@@ -197,12 +207,39 @@ public final class SaveSync {
         current.start();
     }
 
+    /**
+     * A game has started: compare both sides without showing anything, and speak up
+     * only if the other side is ahead. Once per game WebView and game.
+     *
+     * The offline game is checked when its page has loaded. The online game is checked
+     * when it first talks to the server, because only then is its client session id
+     * known, and a check under any other id would invalidate the game's session.
+     */
+    private static void checkAtStart(String gameHost) {
+        boolean online = ONLINE_HOST.equals(gameHost);
+        if (online ? checkedOnline : checkedOffline) {
+            return;
+        }
+        if (online) {
+            checkedOnline = true;
+        } else {
+            checkedOffline = true;
+        }
+        Activity activity = activityRef.get();
+        if (activity == null || activity.isFinishing() || current != null) {
+            return;
+        }
+        current = new Session(activity, ENTRY_SYNC);
+        current.startQuietly(gameHost);
+    }
+
     /** Receives the online game's client session id from the script in CLIENT_ID_JS. */
     private static final class GameBridge {
         @JavascriptInterface
         public void clientId(String id) {
-            if (id != null && id.matches("[A-Za-z0-9]{32}")) {
+            if (id != null && id.matches("[A-Za-z0-9]{32}") && !id.equals(gameClientId)) {
                 gameClientId = id;
+                MAIN.post(() -> checkAtStart(ONLINE_HOST));
             }
         }
     }
@@ -256,6 +293,10 @@ public final class SaveSync {
         /** True once this session has talked to the server under an id of its own. */
         private boolean tookOverSession;
         private boolean reloadedOnline;
+        /** The game whose start began this session, or null if a drawer entry did. */
+        private String startedGame;
+        /** While true the session shows nothing, and ends without a word if anything fails. */
+        private boolean quiet;
 
         Session(Activity activity, int entry) {
             this.activity = activity;
@@ -277,6 +318,13 @@ public final class SaveSync {
             } else {
                 beginCheck();
             }
+        }
+
+        /** The check at a game's start. See checkAtStart. */
+        void startQuietly(String gameHost) {
+            startedGame = gameHost;
+            quiet = true;
+            beginCheck();
         }
 
         // ---- Reading both sides ----
@@ -467,7 +515,9 @@ public final class SaveSync {
                 return;
             }
             log("comparison done");
-            if (restoreId != null) {
+            if (quiet) {
+                warnIfBehind();
+            } else if (restoreId != null) {
                 sendBackupOnline();
             } else if (entry == ENTRY_COPY_STARTERS) {
                 offerStarterLists();
@@ -488,6 +538,69 @@ public final class SaveSync {
 
         private JSONObject onlineSnapshot() {
             return snapshot(onlineSave, onlineHistory, onlineSessions);
+        }
+
+        // ---- The check at a game's start ----
+
+        /**
+         * Speaks up if save data or a run in progress is ahead on the other side from
+         * the game being started. Otherwise the session ends without showing anything.
+         *
+         * A slot that holds a different run on each side is left out: neither run is
+         * behind the other, and replacing one belongs in the menu, not in a prompt.
+         */
+        private void warnIfBehind() {
+            boolean offline = OFFLINE_HOST.equals(startedGame);
+            String direction = offline ? DOWN : UP;
+            JSONObject recommended = compared.optJSONObject("recommended");
+            final JSONObject plan = towards(recommended == null ? new JSONObject() : recommended, direction);
+            // The start of the recommendation's line for each slot left out, as offline.js writes it.
+            List<String> skipped = new ArrayList<String>();
+            JSONArray moves = plan.optJSONArray("sessions");
+            for (int slot = 0; slot < SLOTS; slot++) {
+                JSONObject mine = objectAt(compared.optJSONArray("localSessions"), slot);
+                JSONObject theirs = objectAt(compared.optJSONArray("onlineSessions"), slot);
+                if (mine != null && theirs != null && !mine.optString("seed").equals(theirs.optString("seed"))) {
+                    try {
+                        moves.put(slot, "");
+                    } catch (JSONException e) {
+                        // cannot happen: the slot exists
+                    }
+                    skipped.add("Run in progress, slot " + (slot + 1) + ":");
+                }
+            }
+            if (onlineProblem != null || (plan.optString("save").isEmpty() && firstMoved(plan) < 0)) {
+                close();
+                return;
+            }
+            quiet = false;
+            StringBuilder message = new StringBuilder(offline
+                    ? "Before you play offline: the online side is ahead.\n"
+                    : "Before you play online: the offline side is ahead.\n");
+            String phrase = offline ? "online to offline" : "offline to online";
+            JSONArray lines = compared.optJSONArray("recommendedLines");
+            for (int i = 0; lines != null && i < lines.length(); i++) {
+                String line = lines.optString(i);
+                boolean left = false;
+                for (String start : skipped) {
+                    left |= line.startsWith(start);
+                }
+                if (line.contains(phrase) && !left) {
+                    message.append("\n").append(line);
+                }
+            }
+            if (!plan.optString("history").isEmpty()) {
+                int added = side(offline ? "onlineHistory" : "localHistory").optInt("notInOther");
+                message.append("\nRun history: ").append(runs(added)).append(offline ? " to offline" : " to online");
+            }
+            message.append(offline
+                    ? "\n\nPlay anyway carries on from the older offline data."
+                    : "\n\nPlay anyway carries on from the older online data.");
+            message.append("\n\n").append(sendsToServer(plan) ? UPLOAD_NOTE + "\n\n" : "").append(BACKUP_NOTE);
+            present(message.toString(),
+                    new String[] {"Sync now", "Open Sync saves"},
+                    new Runnable[] {() -> execute(plan, "Sync finished"), this::showMenu},
+                    "Play anyway");
         }
 
         // ---- Sync saves: the menu ----
@@ -1070,6 +1183,10 @@ public final class SaveSync {
         private void fail(String message) {
             arrived();
             step = IDLE;
+            if (quiet) {
+                close();
+                return;
+            }
             present(message + "\n\nLOG\n" + log, new String[] {"Copy log"}, new Runnable[] {this::copyLog}, "Close");
         }
 
@@ -1087,6 +1204,9 @@ public final class SaveSync {
 
         /** A dialog with no actions that shows the log as it grows. */
         private void showProgress(String heading, boolean cancellable) {
+            if (quiet) {
+                return;
+            }
             TextView text = present(heading + "\n\n" + log, new String[0], new Runnable[0],
                     cancellable ? "Cancel" : null);
             liveHeading = heading;
@@ -1348,6 +1468,25 @@ public final class SaveSync {
             }
         }
         return -1;
+    }
+
+    /** The parts of a plan that move in one direction. Merging run history counts for both. */
+    private static JSONObject towards(JSONObject plan, String direction) {
+        String history = plan.optString("history");
+        JSONArray moves = plan.optJSONArray("sessions");
+        JSONObject out = new JSONObject();
+        JSONArray slots = new JSONArray();
+        for (int slot = 0; slot < SLOTS; slot++) {
+            slots.put(direction.equals(textAt(moves, slot)) ? direction : "");
+        }
+        try {
+            out.put("save", direction.equals(plan.optString("save")) ? direction : "");
+            out.put("history", direction.equals(history) || BOTH.equals(history) ? direction : "");
+            out.put("sessions", slots);
+        } catch (JSONException e) {
+            // cannot happen: the keys are not null
+        }
+        return out;
     }
 
     /** Whether a plan replaces anything on the offline side. */
