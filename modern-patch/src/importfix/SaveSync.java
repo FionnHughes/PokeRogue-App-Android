@@ -124,6 +124,9 @@ public final class SaveSync {
     private static final String DOWN = "down"; // online to offline
     private static final String UP = "up"; // offline to online
     private static final String BOTH = "both"; // run history only: merge into both sides
+    /** A slot only: remove the run there, because it has already ended on the other side. */
+    private static final String END_OFFLINE = "endDown";
+    private static final String END_ONLINE = "endUp";
 
     /** What a session is waiting for. Answers that arrive in any other step are ignored. */
     private static final int IDLE = 0;
@@ -707,7 +710,8 @@ public final class SaveSync {
             for (int slot = 0; slot < SLOTS; slot++) {
                 JSONObject mine = objectAt(compared.optJSONArray("localSessions"), slot);
                 JSONObject theirs = objectAt(compared.optJSONArray("onlineSessions"), slot);
-                if (mine != null && theirs != null && !mine.optString("seed").equals(theirs.optString("seed"))) {
+                if (mine != null && theirs != null && !mine.optString("seed").equals(theirs.optString("seed"))
+                        && mine.optJSONObject("ended") == null && theirs.optJSONObject("ended") == null) {
                     try {
                         moves.put(slot, "");
                     } catch (JSONException e) {
@@ -725,6 +729,7 @@ public final class SaveSync {
                     ? "Before you play offline: the online side is ahead.\n"
                     : "Before you play online: the offline side is ahead.\n");
             String phrase = offline ? "online to offline" : "offline to online";
+            String removal = offline ? "remove from offline" : "remove from online";
             JSONArray lines = compared.optJSONArray("recommendedLines");
             for (int i = 0; lines != null && i < lines.length(); i++) {
                 String line = lines.optString(i);
@@ -732,7 +737,7 @@ public final class SaveSync {
                 for (String start : skipped) {
                     left |= line.startsWith(start);
                 }
-                if (line.contains(phrase) && !left) {
+                if ((line.contains(phrase) || line.contains(removal)) && !left) {
                     message.append("\n").append(line);
                 }
             }
@@ -772,11 +777,11 @@ public final class SaveSync {
                 if (knowsHistory()) {
                     message.append("\n").append(describeHistory(side("onlineHistory"), "offline"));
                 }
-                message.append("\n").append(describeSessions(compared.optJSONArray("onlineSessions")));
+                message.append("\n").append(describeSessions(compared.optJSONArray("onlineSessions"), "offline"));
             }
             message.append("\n\nOFFLINE\n").append(describeSave(local));
             message.append("\n").append(describeHistory(side("localHistory"), knowsHistory() ? "online" : null));
-            message.append("\n").append(describeSessions(compared.optJSONArray("localSessions")));
+            message.append("\n").append(describeSessions(compared.optJSONArray("localSessions"), "online"));
             message.append("\n\nRECOMMENDED\n");
             String lines = joinLines(compared.optJSONArray("recommendedLines"));
             if (onlineProblem != null) {
@@ -789,6 +794,7 @@ public final class SaveSync {
             if (knowsHistory()) {
                 message.append("\n\nOnline run history is only what Online mode in this app has recorded.");
             }
+            message.append("\n\nThis app: build ").append(BuildInfo.BUILD).append(".");
 
             present(message.toString(),
                     new String[] {
@@ -796,13 +802,18 @@ public final class SaveSync {
                         "Copy online to offline...",
                         "Copy offline to online...",
                         "Show log",
-                        "Show tips"},
+                        "Show tips",
+                        "Check for updates"},
                     new Runnable[] {
                         () -> confirmRecommended(recommended),
                         () -> chooseParts(DOWN),
                         () -> chooseParts(UP),
                         this::showLog,
-                        () -> showTip(0)},
+                        () -> showTip(0),
+                        () -> {
+                            close();
+                            Updater.checkNow(activity);
+                        }},
                     "Close");
         }
 
@@ -824,7 +835,7 @@ public final class SaveSync {
             final boolean history = knowsHistory()
                     && side(down ? "onlineHistory" : "localHistory").optInt("runs") > 0;
             final boolean sessions = sessionsKnown && (down ? onlineProblem == null : canUpload())
-                    && count(compared.optJSONArray(down ? "onlineSessions" : "localSessions")) > 0;
+                    && firstMoved(planFor(direction, false, false, true)) >= 0;
             String heading = down ? "Copy online to offline" : "Copy offline to online";
             int parts = (save ? 1 : 0) + (history ? 1 : 0) + (sessions ? 1 : 0);
             if (parts == 0) {
@@ -841,21 +852,25 @@ public final class SaveSync {
                         sessions ? "Runs in progress only" : null,
                         "Back"},
                     new Runnable[] {
-                        () -> confirmCopy(down, planFor(direction, save, history, sessions)),
-                        () -> confirmCopy(down, planFor(direction, true, false, false)),
-                        () -> confirmCopy(down, planFor(direction, false, true, false)),
-                        () -> confirmCopy(down, planFor(direction, false, false, true)),
+                        () -> confirmCopy(down, planFor(direction, save, history, sessions), sessions),
+                        () -> confirmCopy(down, planFor(direction, true, false, false), false),
+                        () -> confirmCopy(down, planFor(direction, false, true, false), false),
+                        () -> confirmCopy(down, planFor(direction, false, false, true), true),
                         this::showMenu},
                     "Close");
         }
 
-        /** A plan that moves the chosen parts one way. Only slots the source side has are moved. */
+        /**
+         * A plan that moves the chosen parts one way. Only slots the source side has are
+         * moved, and not a run that has already ended on the side it would go to.
+         */
         private JSONObject planFor(String direction, boolean save, boolean history, boolean sessions) {
             JSONArray source = compared.optJSONArray(DOWN.equals(direction) ? "onlineSessions" : "localSessions");
             JSONObject plan = new JSONObject();
             JSONArray slots = new JSONArray();
             for (int slot = 0; slot < SLOTS; slot++) {
-                slots.put(sessions && objectAt(source, slot) != null ? direction : "");
+                JSONObject run = objectAt(source, slot);
+                slots.put(sessions && run != null && run.optJSONObject("ended") == null ? direction : "");
             }
             try {
                 plan.put("save", save ? direction : "");
@@ -867,9 +882,18 @@ public final class SaveSync {
             return plan;
         }
 
-        private void confirmCopy(final boolean down, final JSONObject plan) {
+        private void confirmCopy(final boolean down, final JSONObject plan, boolean withRuns) {
+            StringBuilder leftOut = new StringBuilder();
+            JSONArray source = compared.optJSONArray(down ? "onlineSessions" : "localSessions");
+            for (int slot = 0; withRuns && slot < SLOTS; slot++) {
+                JSONObject run = objectAt(source, slot);
+                if (run != null && run.optJSONObject("ended") != null) {
+                    leftOut.append("Slot ").append(slot + 1).append(" is left out: that run already ended ")
+                            .append(down ? "offline" : "online").append(". The recommended sync removes it.\n");
+                }
+            }
             String message = (down ? "Copy online to offline" : "Copy offline to online") + "\n\n"
-                    + describePlan(plan)
+                    + describePlan(plan) + leftOut
                     + "\n" + (sendsToServer(plan) ? UPLOAD_NOTE + "\n\n" : "") + BACKUP_NOTE;
             present(message,
                     new String[] {"Copy", "Back"},
@@ -939,7 +963,8 @@ public final class SaveSync {
                     out.append("WARNING: that goes back from wave ").append(target.optInt("wave"))
                             .append(" to wave ").append(source.optInt("wave"))
                             .append(down ? ".\n" : ". The server refuses that.\n");
-                } else if (!sameRun && target.optLong("timestamp") > source.optLong("timestamp")) {
+                } else if (!sameRun && target.optJSONObject("ended") == null
+                        && target.optLong("timestamp") > source.optLong("timestamp")) {
                     out.append("WARNING: the run it replaces is a different, newer run.\n");
                 }
             }
@@ -1010,14 +1035,16 @@ public final class SaveSync {
             String save = parts.optString("save");
             String history = parts.optString("history");
             JSONArray sessions = parts.optJSONArray("sessions");
+            JSONArray remove = parts.optJSONArray("remove");
             JSONObject payload = new JSONObject();
             try {
-                if (!backUpOnline(save, history, sessions, backupReason)) {
+                if (!backUpOnline(save, history, sessions, remove, backupReason)) {
                     fail("A backup of the online side could not be stored first. Online was not changed.");
                     return;
                 }
                 payload.put("save", save);
                 payload.put("sessions", sessions == null ? new JSONArray() : sessions);
+                payload.put("remove", remove == null ? new JSONArray() : remove);
                 payload.put("username", onlineUser);
                 // Stored the way the online game keeps it.
                 payload.put("history", history.isEmpty() ? "" : CryptoJsAes.encrypt(history, GAME_STORAGE_KEY));
@@ -1031,7 +1058,7 @@ public final class SaveSync {
         }
 
         /** Stores what the upload replaces on the online side. True if there was nothing to keep. */
-        private boolean backUpOnline(String save, String history, JSONArray sessions, String reason)
+        private boolean backUpOnline(String save, String history, JSONArray sessions, JSONArray remove, String reason)
                 throws JSONException {
             String keptSave = save.isEmpty() ? "" : onlineSave;
             int runs = side("onlineHistory").optInt("runs");
@@ -1041,7 +1068,8 @@ public final class SaveSync {
             boolean anySession = false;
             JSONArray known = compared.optJSONArray("onlineSessions");
             for (int slot = 0; slot < SLOTS; slot++) {
-                boolean kept = !textAt(sessions, slot).isEmpty() && !onlineSessions[slot].isEmpty();
+                boolean changes = !textAt(sessions, slot).isEmpty() || (remove != null && remove.optBoolean(slot));
+                boolean kept = changes && !onlineSessions[slot].isEmpty();
                 keptSessions.put(kept ? onlineSessions[slot] : "");
                 JSONObject summary = kept ? objectAt(known, slot) : null;
                 summaries.put(summary == null ? JSONObject.NULL : summary);
@@ -1124,7 +1152,7 @@ public final class SaveSync {
             JSONObject save = result.optJSONObject("save");
             if (save != null && !succeeded(save)) {
                 problems.add("Save data: " + refusal(save.optInt("status"), save.optString("body")));
-                if (wantsHistory || count(wanted) > 0) {
+                if (wantsHistory || count(wanted) > 0 || removes(pendingUpload)) {
                     problems.add("The run history and runs in progress go with the save data, so they were not sent.");
                 }
                 return false;
@@ -1228,7 +1256,7 @@ public final class SaveSync {
                     + "\nFrom: " + meta.optString("origin", "unknown") + ", " + meta.optString("reason", "")
                     + "\n\nSAVE DATA\n" + (save != null ? describeSave(save) : "Not in this backup.")
                     + "\n\nRUN HISTORY\n" + (runs > 0 ? runs(runs) : "Not in this backup.")
-                    + "\n\nRUNS IN PROGRESS\n" + (count(sessions) > 0 ? slotLines(sessions) : "Not in this backup.")
+                    + "\n\nRUNS IN PROGRESS\n" + (count(sessions) > 0 ? slotLines(sessions, null) : "Not in this backup.")
                     + "\n\nRestoring replaces only the parts this backup has, and backs those up first.";
             final boolean touchesServer = save != null || count(sessions) > 0;
             Runnable toOffline = () -> {
@@ -1624,14 +1652,30 @@ public final class SaveSync {
         return -1;
     }
 
-    /** The parts of a plan that move in one direction. Merging run history counts for both. */
+    /** Whether an upload empties any online slot. */
+    private static boolean removes(JSONObject payload) {
+        JSONArray remove = payload.optJSONArray("remove");
+        for (int slot = 0; remove != null && slot < remove.length(); slot++) {
+            if (remove.optBoolean(slot)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The parts of a plan that change one side: what moves in that direction, and runs
+     * to remove from the side it leads to. Merging run history counts for both.
+     */
     private static JSONObject towards(JSONObject plan, String direction) {
         String history = plan.optString("history");
         JSONArray moves = plan.optJSONArray("sessions");
         JSONObject out = new JSONObject();
         JSONArray slots = new JSONArray();
         for (int slot = 0; slot < SLOTS; slot++) {
-            slots.put(direction.equals(textAt(moves, slot)) ? direction : "");
+            String move = textAt(moves, slot);
+            boolean removal = (DOWN.equals(direction) ? END_OFFLINE : END_ONLINE).equals(move);
+            slots.put(direction.equals(move) || removal ? move : "");
         }
         try {
             out.put("save", direction.equals(plan.optString("save")) ? direction : "");
@@ -1651,14 +1695,14 @@ public final class SaveSync {
         }
         JSONArray moves = plan.optJSONArray("sessions");
         for (int slot = 0; slot < SLOTS; slot++) {
-            if (DOWN.equals(textAt(moves, slot))) {
+            if (DOWN.equals(textAt(moves, slot)) || END_OFFLINE.equals(textAt(moves, slot))) {
                 return true;
             }
         }
         return false;
     }
 
-    /** Whether a plan sends save data or a run in progress to the server. */
+    /** Whether a plan sends save data or a run in progress to the server. Removing an ended run does not count. */
     private static boolean sendsToServer(JSONObject plan) {
         if (UP.equals(plan.optString("save"))) {
             return true;
@@ -1740,11 +1784,12 @@ public final class SaveSync {
         return line;
     }
 
-    private static String describeSessions(JSONArray sessions) {
-        return count(sessions) == 0 ? "Runs in progress: none" : "Runs in progress:\n" + slotLines(sessions);
+    /** `other` names the other side, where a run may already have ended; null for no such check. */
+    private static String describeSessions(JSONArray sessions, String other) {
+        return count(sessions) == 0 ? "Runs in progress: none" : "Runs in progress:\n" + slotLines(sessions, other);
     }
 
-    private static String slotLines(JSONArray sessions) {
+    private static String slotLines(JSONArray sessions, String other) {
         StringBuilder out = new StringBuilder();
         for (int slot = 0; slot < SLOTS; slot++) {
             JSONObject session = objectAt(sessions, slot);
@@ -1752,6 +1797,11 @@ public final class SaveSync {
                 out.append(out.length() == 0 ? "" : "\n").append("  Slot ").append(slot + 1).append(": ")
                         .append(describeSession(session)).append(", saved ")
                         .append(formatTime(session.optLong("timestamp")));
+                JSONObject ended = other == null ? null : session.optJSONObject("ended");
+                if (ended != null) {
+                    out.append("\n    This run already ended ").append(other).append(", at wave ")
+                            .append(ended.optInt("wave")).append(".");
+                }
             }
         }
         return out.toString();

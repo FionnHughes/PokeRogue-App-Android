@@ -128,7 +128,8 @@
     });
   }
 
-  // payload: { save, sessions[5], username, history } with '' for "leave alone".
+  // payload: { save, sessions[5], remove[5], username, history } with '' for "leave alone".
+  // remove marks slots to empty: runs that have ended on the offline side.
   // history is the run history as the game stores it (already encrypted).
   // The save data goes first. If the server refuses it, nothing else is sent, because
   // the runs in progress and the run history belong with that save.
@@ -143,8 +144,12 @@
       }
     }
     var slots = [];
-    for (var slot = 0; slot < SLOTS; slot++) { if (payload.sessions && payload.sessions[slot]) { slots.push(slot); } }
-    if (!payload.save && !slots.length) {
+    var removals = [];
+    for (var slot = 0; slot < SLOTS; slot++) {
+      if (payload.sessions && payload.sessions[slot]) { slots.push(slot); }
+      else if (payload.remove && payload.remove[slot]) { removals.push(slot); }
+    }
+    if (!payload.save && !slots.length && !removals.length) {
       result.status = 200;
       try { writeHistory(); } catch (e) { result.historyProblem = problem(e); }
       done();
@@ -169,6 +174,21 @@
         if (sent.ok && payload.username) { localStorage.removeItem(sessionCacheKey(slot, payload.username)); }
         return sendSessions(index, position + 1, ids);
       });
+    }
+    // The same request the game makes for "delete" in its load menu.
+    function removeSessions(index, position) {
+      if (position >= removals.length) { return Promise.resolve(); }
+      var slot = removals[position];
+      host.log('removing the ended run in slot ' + (slot + 1));
+      return fetch(ROOT + 'savedata/session/delete?slot=' + slot + '&clientSessionId=' + id, { headers: headers(index) })
+        .then(function(response) {
+          return response.text().then(function(text) {
+            result.sessions[slot] = { status: response.status, body: text.trim().slice(0, 200) };
+            host.log('server answered ' + response.status);
+            if (response.ok && payload.username) { localStorage.removeItem(sessionCacheKey(slot, payload.username)); }
+            return removeSessions(index, position + 1);
+          });
+        });
     }
     // The game sends the account's trainer and secret id along with a run.
     function idsOf(saveText) {
@@ -196,6 +216,8 @@
       return saveStep.then(function(ok) {
         if (!ok) { return; }
         return sendSessions(got.index, 0, idsOf(payload.save || got.text)).then(function() {
+          return removeSessions(got.index, 0);
+        }).then(function() {
           try { writeHistory(); } catch (e) { result.historyProblem = problem(e); }
         });
       });

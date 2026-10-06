@@ -65,6 +65,61 @@ final class Updater {
         }, "update-check").start();
     }
 
+    /**
+     * The same check, asked for from the Sync saves menu. Unlike the check at the
+     * app's start it always answers: what this build is, what the server has, or why
+     * the server could not be read. A build that is not newer can be installed anyway.
+     */
+    static void checkNow(final Activity activity) {
+        final AlertDialog waiting = new AlertDialog.Builder(activity)
+                .setTitle("Update")
+                .setMessage("Asking the update server...")
+                .create();
+        try {
+            waiting.show();
+        } catch (RuntimeException e) {
+            return; // the activity has no window to show a dialog in
+        }
+        new Thread(() -> {
+            UpdateFiles.Latest found = null;
+            String problem = "";
+            try {
+                found = UpdateFiles.latest(BuildInfo.UPDATE_URL);
+            } catch (IOException | JSONException | RuntimeException e) {
+                problem = e.getClass().getSimpleName() + ": " + e.getMessage();
+            }
+            final UpdateFiles.Latest latest = found;
+            final String why = problem;
+            MAIN.post(() -> {
+                try {
+                    waiting.dismiss();
+                } catch (RuntimeException e) {
+                    // its window is already gone
+                }
+                new Updater(activity, latest).report(why);
+            });
+        }, "update-check").start();
+    }
+
+    private void report(String problem) {
+        String mine = "This app is build " + BuildInfo.BUILD + ".";
+        if (latest == null) {
+            show(new AlertDialog.Builder(activity)
+                    .setTitle("Update")
+                    .setMessage(mine + "\n\nThe update server could not be read.\n\n" + BuildInfo.UPDATE_URL
+                            + "\n" + problem)
+                    .setNegativeButton("Close", null));
+        } else if (latest.build > BuildInfo.BUILD) {
+            offer();
+        } else {
+            show(new AlertDialog.Builder(activity)
+                    .setTitle("Update")
+                    .setMessage(mine + " The server has build " + latest.build + ".\n\nThere is nothing newer.")
+                    .setPositiveButton("Install build " + latest.build + " anyway", (d, which) -> download())
+                    .setNegativeButton("Close", null));
+        }
+    }
+
     // ---- The dialogs, on the main thread ----
 
     private void offer() {

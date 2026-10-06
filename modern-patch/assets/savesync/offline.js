@@ -10,7 +10,9 @@
 //
 // A "snapshot" is { save, history, sessions[5] }, each a JSON text or '' for none.
 // A "plan" says where each part goes: 'down' (online to offline), 'up' (offline to
-// online), 'both' (run history only: merge into both), or '' (leave alone).
+// online), 'both' (run history only: merge into both), or '' (leave alone). A slot can
+// also be 'endDown' or 'endUp': remove the run from offline or from online, because
+// it has already ended on the other side.
 (function() {
   var SLOTS = 5;
   var HISTORY_LIMIT = 25; // the game's own cap on stored runs
@@ -101,6 +103,20 @@
       mode: MODES[d.gameMode] || 'Run'
     };
   }
+  // Whether a run in progress has already ended on the other side: that side's run
+  // history then holds the same run (same seed) at the same wave or later. Answers
+  // { wave, victory } or null. A run that ended is over, wherever a copy of it remains.
+  function endedIn(session, otherHistoryText) {
+    if (!session || !session.seed) { return null; }
+    var finished = runs(otherHistoryText);
+    for (var k in finished) {
+      var entry = finished[k] && finished[k].entry;
+      if (entry && String(entry.seed || '') === session.seed && (Number(entry.waveIndex) || 0) >= session.wave) {
+        return { wave: Number(entry.waveIndex) || 0, victory: !!finished[k].isVictory };
+      }
+    }
+    return null;
+  }
   // Adds the source's runs to the target's and keeps the newest ones.
   function mergeHistory(sourceText, targetText) {
     var merged = runs(targetText);
@@ -168,6 +184,22 @@
         var theirs = summarizeSession(online.sessions[i]);
         var pick = '';
         var why = '';
+        // A copy of a run that has ended on the other side is not a run in progress any
+        // more. It is removed, or replaced if the other side has a live run in that slot.
+        var mineOver = endedIn(mine, online.history);
+        var theirsOver = endedIn(theirs, local.history);
+        if (mineOver || theirsOver) {
+          if (mineOver) { pick = theirs && !theirsOver ? 'down' : 'endDown'; }
+          else { pick = mine ? 'up' : 'endUp'; }
+          if ((pick === 'up' || pick === 'endUp') && !flags.canUpload) { continue; }
+          plan.sessions[i] = pick;
+          var over = mineOver || theirsOver;
+          lines.push('Run in progress, slot ' + (i + 1) + ': '
+            + (pick === 'endDown' ? 'remove from offline' : pick === 'endUp' ? 'remove from online' : direction(pick))
+            + ' (' + (mineOver ? 'the offline copy is of a run that ended online' : 'the online copy is of a run that ended offline')
+            + ' at wave ' + over.wave + ')');
+          continue;
+        }
         if (mine && !theirs) { pick = 'up'; why = 'only offline has one'; }
         else if (theirs && !mine) { pick = 'down'; why = 'only online has one'; }
         else if (mine && theirs) {
@@ -222,13 +254,21 @@
         online = normalize(onlineSnapshot);
         var local = localSnapshot();
         var recommended = recommend(local, online, flags || {});
+        // Each run in progress also says whether it has ended on the other side.
+        var describe = function(texts, otherHistory) {
+          return texts.map(function(text) {
+            var session = summarizeSession(text);
+            if (session) { session.ended = endedIn(session, otherHistory); }
+            return session;
+          });
+        };
         host.onCompared(JSON.stringify({
           local: summarizeSave(local.save),
           online: summarizeSave(online.save),
           localHistory: summarizeHistory(local.history, online.history),
           onlineHistory: summarizeHistory(online.history, local.history),
-          localSessions: local.sessions.map(summarizeSession),
-          onlineSessions: online.sessions.map(summarizeSession),
+          localSessions: describe(local.sessions, online.history),
+          onlineSessions: describe(online.sessions, local.history),
           recommended: recommended.plan,
           recommendedLines: recommended.lines
         }));
@@ -244,6 +284,7 @@
         var local = localSnapshot();
         var replaced = emptySnapshot();
         var upload = emptySnapshot();
+        upload.remove = [false, false, false, false, false]; // online slots to empty
         var mergedHistory = plan.history ? mergeHistory(
           plan.history === 'up' ? local.history : online.history,
           plan.history === 'up' ? online.history : local.history) : '';
@@ -265,6 +306,10 @@
           } else if (move === 'up') {
             if (!parse(local.sessions[i])) { throw new Error('offline slot ' + (i + 1) + ' is empty'); }
             upload.sessions[i] = local.sessions[i];
+          } else if (move === 'endDown') {
+            replaced.sessions[i] = local.sessions[i];
+          } else if (move === 'endUp') {
+            upload.remove[i] = true;
           }
         }
 
@@ -274,9 +319,11 @@
         if (plan.history === 'down' || plan.history === 'both') { store(historyKey(), mergedHistory); }
         for (var j = 0; j < SLOTS; j++) {
           if (plan.sessions && plan.sessions[j] === 'down') { store(sessionKey(j), online.sessions[j]); }
+          if (plan.sessions && plan.sessions[j] === 'endDown') { localStorage.removeItem(sessionKey(j)); }
         }
 
-        var hasUpload = upload.save || upload.history || upload.sessions.some(function(s) { return !!s; });
+        var hasUpload = upload.save || upload.history || upload.sessions.some(function(s) { return !!s; })
+          || upload.remove.some(function(r) { return r; });
         host.onExecuted(true, '', hasUpload ? JSON.stringify(upload) : '');
       } catch (e) {
         host.onExecuted(false, String((e && e.message) || e), '');
