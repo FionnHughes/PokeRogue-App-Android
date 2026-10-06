@@ -58,6 +58,10 @@ jobs:
           android_jar="$ANDROID_HOME/platforms/$platform/android.jar"
           echo "using $platform and build-tools $tools"
           mkdir -p work/helper/classes work/helper/dex
+          # The build's number is this workflow's run number, so later builds have higher
+          # ones. The app compares it with the number its update server announces.
+          sed -i "s/BUILD = 0;/BUILD = ${GITHUB_RUN_NUMBER};/" modern-patch/src/importfix/BuildInfo.java
+          grep -q "BUILD = ${GITHUB_RUN_NUMBER};" modern-patch/src/importfix/BuildInfo.java
           javac --release 8 -cp "$android_jar" -d work/helper/classes \
             $(find modern-patch/src -name '*.java')
           "$ANDROID_HOME/build-tools/$tools/d8" --min-api 28 --lib "$android_jar" \
@@ -118,13 +122,36 @@ jobs:
           grep -qF 'Limportfix/SaveSync;->setActivity(Landroid/app/Activity;)V' verify/smali_classes2/labs/smarty/offlinerogue/MainActivity.smali
           echo "hooks and helper match"
 
-      - name: Check the launch mode change
+      - name: Check the manifest changes
         run: |
-          # The patched manifest must differ from the original by exactly one byte.
+          # The manifest is edited in its compiled form. Read both versions with Android's
+          # own tool: the only differences may be the launch mode and the added permission.
           cd work
-          changed=$(cmp -l <(unzip -p modern.apk AndroidManifest.xml) <(unzip -p ../OfflineRogue-Modern-importfix.apk AndroidManifest.xml) | wc -l)
-          echo "manifest bytes changed: $changed"
-          [ "$changed" = "1" ]
+          tools=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          aapt2="$ANDROID_HOME/build-tools/$tools/aapt2"
+          "$aapt2" dump xmltree --file AndroidManifest.xml modern.apk > manifest-original.txt
+          "$aapt2" dump xmltree --file AndroidManifest.xml ../OfflineRogue-Modern-importfix.apk > manifest-patched.txt
+          diff manifest-original.txt manifest-patched.txt > manifest.diff || true
+          cat manifest.diff
+          [ "$(grep -c '^[<>]' manifest.diff)" = "4" ]
+          grep -q '^< .*launchMode(0x0101001d)=3' manifest.diff
+          grep -q '^> .*launchMode(0x0101001d)=2' manifest.diff
+          grep -q '^> .*E: uses-permission' manifest.diff
+          grep -q '^> .*android.permission.REQUEST_INSTALL_PACKAGES' manifest.diff
+
+      - name: Describe the build for the update server
+        run: |
+          # latest.json goes on the update server next to the APK (stored there as app.apk).
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          apk = "OfflineRogue-Modern-importfix.apk"
+          data = open(apk, "rb").read()
+          notes = subprocess.run(["git", "log", "-1", "--format=%s"], capture_output=True, text=True).stdout.strip()
+          json.dump({"build": int(os.environ["GITHUB_RUN_NUMBER"]), "apk": "app.apk",
+                     "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "notes": notes},
+                    open("latest.json", "w"), indent=1)
+          print(open("latest.json").read())
+          PY
 
       - name: Publish as a draft release
         env:
@@ -135,8 +162,8 @@ jobs:
           gh release list --limit 100 --json tagName,isDraft \
             --jq '.[] | select(.isDraft and (.tagName | startswith("modern-importfix-"))) | .tagName' \
             | while read -r old; do gh release delete "$old" --yes || true; done
-          gh release create "$tag" OfflineRogue-Modern-importfix.apk \
+          gh release create "$tag" OfflineRogue-Modern-importfix.apk latest.json \
             --draft \
             --target "$GITHUB_SHA" \
-            --title "Modern app with import fix and online sync (private draft) ${GITHUB_SHA::7}" \
-            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix and three drawer entries patched in: Copy Pokemon caught, Sync saves (save data, run history and runs in progress, with a recommended sync and a step-by-step log) and Restore backup. Starting a game also checks quietly whether the other side is ahead and warns if so. Upright, the game sits a little below the top of the screen with a clock above it, and a few tips show when the app opens. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."
+            --title "Modern app with import fix and online sync (private draft) build ${GITHUB_RUN_NUMBER}, ${GITHUB_SHA::7}" \
+            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix and three drawer entries patched in: Copy Pokemon caught, Sync saves (save data, run history and runs in progress, with a recommended sync and a step-by-step log) and Restore backup. Starting a game also checks quietly whether the other side is ahead and warns if so. Upright, the game sits a little below the top of the screen with a clock above it, and a few tips show when the app opens. The app checks its owner's server for a newer build when it opens and can install it; latest.json describes this build for that server. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."

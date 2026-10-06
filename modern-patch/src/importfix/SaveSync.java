@@ -207,6 +207,7 @@ public final class SaveSync {
         if (!tipsOffered) {
             tipsOffered = true;
             MAIN.postDelayed(SaveSync::offerTips, TIPS_DELAY_MS);
+            Updater.check(activity); // in the background; it only speaks up if there is a newer build
         }
     }
 

@@ -1,0 +1,21 @@
+package importfix;
+
+/** What this build is and where newer ones are announced. */
+final class BuildInfo {
+    /**
+     * This build's number. The workflow that builds the APK writes its run number
+     * here, so later builds have higher numbers. It stays 0 in a build made any other
+     * way, and such a build never offers to update itself.
+     */
+    static final int BUILD = 0;
+
+    /**
+     * A small JSON file describing the newest build, on the owner's own server:
+     * {"build": 12, "apk": "app.apk", "sha256": "...", "size": 123, "notes": "..."}.
+     * "apk" is relative to this file.
+     */
+    static final String UPDATE_URL = "https://fionnhughes.dev/pr/latest.json";
+
+    private BuildInfo() {
+    }
+}

@@ -11,6 +11,8 @@ The Modern app's source is not public, so the fix is applied to its decoded code
   3. The activity's launch mode changes from singleInstance to singleTask.
      Android cancels a file picker's result straight away when the app that
      opened it is singleInstance, so the picked save never reached the game.
+     The manifest also gains the REQUEST_INSTALL_PACKAGES permission, which the
+     in-app updater needs to hand a downloaded build to Android's installer.
   4. Hooks call importfix.SaveSync (modern-patch/src), which the workflow
      compiles and adds to the APK as classes3.dex. It adds "Copy Pokémon caught",
      "Sync saves" and "Restore backup" entries to the drawer's Tools list and an
@@ -41,8 +43,13 @@ DRAWER_ENTRIES = [
 ORIGINAL_TOOLS = 6
 
 # Binary AndroidManifest.xml constants
+RES_STRING_POOL = 0x0001
 RES_XML_RESOURCE_MAP = 0x0180
 RES_XML_START_ELEMENT = 0x0102
+RES_XML_END_ELEMENT = 0x0103
+STRING_POOL_UTF8 = 1 << 8
+TYPE_STRING = 0x03
+INSTALL_PERMISSION = "android.permission.REQUEST_INSTALL_PACKAGES"
 ATTR_LAUNCH_MODE = 0x0101001D
 LAUNCH_SINGLE_TASK = 2
 LAUNCH_SINGLE_INSTANCE = 3
@@ -81,6 +88,88 @@ def patch_launch_mode(manifest: Path) -> None:
     if patched != 1:
         sys.exit(f"manifest: expected one launchMode attribute, patched {patched}")
     manifest.write_bytes(data)
+
+
+def _pool_strings(data: bytearray, pool: int) -> list:
+    """The strings of a binary XML string pool (UTF-16, as manifests are compiled), in order."""
+    header_size, _, count, _, _, strings_start, _ = struct.unpack_from("<HIIIIII", data, pool + 2)
+    out = []
+    for index in range(count):
+        at = pool + strings_start + struct.unpack_from("<I", data, pool + header_size + 4 * index)[0]
+        size = struct.unpack_from("<H", data, at)[0]
+        out.append(data[at + 2:at + 2 + 2 * size].decode("utf-16-le", "replace"))
+    return out
+
+
+def _encode_pool_string(text: str) -> bytes:
+    if len(text) > 0x7FFF:
+        sys.exit("manifest: string too long")
+    return struct.pack("<H", len(text)) + text.encode("utf-16-le") + b"\0\0"
+
+
+def add_permission(manifest: Path, permission: str) -> None:
+    """Add <uses-permission android:name="..."/> to the binary manifest.
+
+    The in-app updater hands the downloaded APK to Android's installer, which only
+    listens to apps that declare REQUEST_INSTALL_PACKAGES. The manifest stays in its
+    compiled form, so this appends one string to the string pool and copies an
+    existing uses-permission element, pointing the copy at the new string. Appending
+    keeps every existing string index, so nothing else in the file has to change.
+    """
+    data = bytearray(manifest.read_bytes())
+    pool = 8
+    chunk_type, header_size, pool_size = struct.unpack_from("<HHI", data, pool)
+    if chunk_type != RES_STRING_POOL:
+        sys.exit("manifest: no string pool where one was expected")
+    count, style_count, flags, strings_start, styles_start = struct.unpack_from("<IIIII", data, pool + 8)
+    if style_count or styles_start or flags & STRING_POOL_UTF8:
+        sys.exit("manifest: the string pool has styles or is UTF-8, which this patch does not handle")
+    strings = _pool_strings(data, pool)
+    if permission in strings:
+        sys.exit(f"manifest: {permission} is already declared")
+
+    # 1. The new string: one more offset entry, and its text after the existing texts.
+    text_length = pool_size - strings_start
+    encoded = _encode_pool_string(permission)
+    encoded += b"\0" * (-(4 + len(encoded)) % 4)  # the chunk stays a multiple of 4 bytes
+    offsets_end = pool + header_size + 4 * count
+    data[pool + pool_size:pool + pool_size] = encoded
+    data[offsets_end:offsets_end] = struct.pack("<I", text_length)
+    grown = 4 + len(encoded)
+    struct.pack_into("<I", data, pool + 4, pool_size + grown)
+    struct.pack_into("<I", data, pool + 8, count + 1)
+    struct.pack_into("<I", data, pool + 20, strings_start + 4)
+    new_index = count
+
+    # 2. A copy of the first plain uses-permission element, placed right after it.
+    offset = pool + pool_size + grown
+    start = None
+    while offset < len(data):
+        chunk_type, header_size, chunk_size = struct.unpack_from("<HHI", data, offset)
+        if chunk_size < 8:
+            sys.exit("manifest: malformed chunk")
+        body = offset + header_size
+        if chunk_type == RES_XML_START_ELEMENT and start is None:
+            name = struct.unpack_from("<I", data, body + 4)[0]
+            attr_start, attr_size, attr_count = struct.unpack_from("<HHH", data, body + 8)
+            attr = body + attr_start
+            if (strings[name] == "uses-permission" and attr_count == 1
+                    and strings[struct.unpack_from("<I", data, attr + 4)[0]] == "name"
+                    and data[attr + 15] == TYPE_STRING):
+                start = (offset, chunk_size, attr)
+        elif chunk_type == RES_XML_END_ELEMENT and start is not None:
+            if strings[struct.unpack_from("<I", data, body + 4)[0]] != "uses-permission":
+                sys.exit("manifest: the uses-permission element has children")
+            element = bytearray(data[start[0]:offset + chunk_size])
+            attr = start[2] - start[0]
+            struct.pack_into("<I", element, attr + 8, new_index)   # the value as written
+            struct.pack_into("<I", element, attr + 16, new_index)  # the value as typed data
+            data[offset + chunk_size:offset + chunk_size] = element
+            struct.pack_into("<I", data, 4, len(data))
+            manifest.write_bytes(data)
+            return
+        offset += chunk_size
+    sys.exit("manifest: no plain uses-permission element to copy")
 
 
 def load_shim() -> str:
@@ -196,6 +285,7 @@ def main() -> None:
 
     patch_tools_list(root)
     patch_launch_mode(Path(sys.argv[1]) / "AndroidManifest.xml")
+    add_permission(Path(sys.argv[1]) / "AndroidManifest.xml", INSTALL_PERMISSION)
     shutil.copytree(ASSETS, Path(sys.argv[1]) / "assets/savesync")
     print("patched the launch mode, the web view hooks, MainActivity and the Tools list")
 
