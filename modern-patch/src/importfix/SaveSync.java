@@ -5,11 +5,17 @@ import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.graphics.Rect;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.view.DisplayCutout;
+import android.view.RoundedCorner;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.webkit.ConsoleMessage;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
@@ -29,8 +35,10 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -56,6 +64,12 @@ import java.util.Locale;
  * starts. If the other side is ahead of the game being started, it says so and
  * offers to sync first.
  *
+ * The first time the app opens, and until told otherwise, a few pages of tips
+ * explain when to sync, how to get the offline game, and what the drawer's tools are.
+ *
+ * In the game's own page, a small gap at the top keeps the game clear of rounded
+ * screen corners and shows the time (assets/savesync/topgap.js).
+ *
  * "Copy Pokémon caught" puts a text list of the Pokémon usable as starters on the
  * clipboard.
  *
@@ -77,6 +91,8 @@ public final class SaveSync {
     private static final int ENTRY_SYNC = 0;
     private static final int ENTRY_COPY_STARTERS = 1;
     private static final int ENTRY_RESTORE = 2;
+    /** Not a drawer entry: the tips shown when the app opens. */
+    private static final int ENTRY_TIPS = 3;
 
     /** The game has five slots for runs in progress. */
     private static final int SLOTS = 5;
@@ -133,6 +149,39 @@ public final class SaveSync {
     private static final String BACKUP_NOTE =
             "Whatever is replaced is backed up first. See Restore backup in the drawer.";
 
+    private static final String PREFERENCES = "savesync";
+    private static final String TIPS_HIDDEN = "tips_hidden";
+    /** Lets the app's first screen appear before the tips do. */
+    private static final long TIPS_DELAY_MS = 1200;
+    /** The gap above the game when the screen does not report its corner radius, in dp. */
+    private static final int DEFAULT_TOP_GAP_DP = 24;
+
+    /** The tips, one page each. The names are the ones the app itself shows. */
+    private static final String[] TIPS = {
+        "Online and offline keep separate saves.\n\n"
+                + "Before you switch from one to the other, sync first: open the side menu, tap Sync saves,"
+                + " then Recommended sync.\n\n"
+                + "If you skip it, the game you switch to carries on from its older data. The app also checks"
+                + " when a game starts and warns you if the other side is ahead.",
+        "Offline needs the game files on your phone.\n\n"
+                + "On the home screen, open the three-dot menu and tap Update offline files. Then turn on"
+                + " Enable offline and launch the game.\n\n"
+                + "Do that again whenever PokéRogue updates. If online is on a newer version than your offline"
+                + " files, syncing can fail.",
+        "The side menu has tools that open without leaving the app:\n\n"
+                + "Type Chart: which types beat which.\n"
+                + "Type Calculator: weaknesses and resistances of a type combination.\n"
+                + "Pokedex: PokéRogue's Pokémon with their moves, abilities and egg moves.\n"
+                + "Team Builder: a team's type coverage.\n"
+                + "Smogon: competitive sets and write-ups.\n"
+                + "PokéRogue Wiki: how the game's systems work.\n\n"
+                + "Added by this build:\n"
+                + "Copy Pokémon caught: your starters as text on the clipboard.\n"
+                + "Sync saves: moves progress between online and offline.\n"
+                + "Restore backup: puts back what a sync replaced.\n"
+                + "The clock above the game: hold it to change the size of the gap at the top.",
+    };
+
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static WeakReference<Activity> activityRef = new WeakReference<Activity>(null);
     private static WeakReference<WebView> gameRef = new WeakReference<WebView>(null);
@@ -142,6 +191,10 @@ public final class SaveSync {
     /** Whether the check at a game's start has run for the current game WebView. Main thread only. */
     private static boolean checkedOffline;
     private static boolean checkedOnline;
+    /** The tips are offered once per run of the app. Main thread only. */
+    private static boolean tipsOffered;
+    /** The text of assets/savesync/topgap.js, read once. */
+    private static String topGapScript;
 
     private SaveSync() {
     }
@@ -151,6 +204,26 @@ public final class SaveSync {
     /** Hook: MainActivity.onCreate. */
     public static void setActivity(Activity activity) {
         activityRef = new WeakReference<Activity>(activity);
+        if (!tipsOffered) {
+            tipsOffered = true;
+            MAIN.postDelayed(SaveSync::offerTips, TIPS_DELAY_MS);
+        }
+    }
+
+    private static void offerTips() {
+        Activity activity = activityRef.get();
+        if (activity == null || activity.isFinishing() || activity.isDestroyed() || current != null) {
+            return;
+        }
+        if (preferences(activity).getBoolean(TIPS_HIDDEN, false)) {
+            return;
+        }
+        current = new Session(activity, ENTRY_TIPS);
+        current.start();
+    }
+
+    private static SharedPreferences preferences(Context context) {
+        return context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE);
     }
 
     /** Hook: where the app configures the game WebView, before it loads anything. */
@@ -166,9 +239,66 @@ public final class SaveSync {
         String host = hostOf(url);
         if (host.equals(OFFLINE_HOST)) {
             view.evaluateJavascript(IMPORT_LOG_JS, null);
+            applyTopGap(view);
             checkAtStart(OFFLINE_HOST);
         } else if (host.equals(ONLINE_HOST)) {
             view.evaluateJavascript(CLIENT_ID_JS, null);
+            applyTopGap(view);
+        }
+    }
+
+    /**
+     * Runs topgap.js in the game's page: a gap above the game, sized from the screen's
+     * corner radius, with a clock in it that keeps clear of camera cutouts.
+     */
+    private static void applyTopGap(WebView view) {
+        try {
+            if (topGapScript == null) {
+                topGapScript = readAsset(view.getContext(), "savesync/topgap.js");
+            }
+            int[] position = new int[2];
+            view.getLocationInWindow(position);
+            float radius = 0;
+            JSONArray cutouts = new JSONArray();
+            WindowInsets insets = view.getRootWindowInsets();
+            if (insets != null) {
+                if (Build.VERSION.SDK_INT >= 31) {
+                    RoundedCorner left = insets.getRoundedCorner(RoundedCorner.POSITION_TOP_LEFT);
+                    RoundedCorner right = insets.getRoundedCorner(RoundedCorner.POSITION_TOP_RIGHT);
+                    radius = Math.max(left == null ? 0 : left.getRadius(), right == null ? 0 : right.getRadius());
+                }
+                DisplayCutout cutout = insets.getDisplayCutout();
+                if (cutout != null) {
+                    for (Rect hole : cutout.getBoundingRects()) {
+                        cutouts.put(new JSONArray().put(hole.left - position[0]).put(hole.top - position[1])
+                                .put(hole.right - position[0]).put(hole.bottom - position[1]));
+                    }
+                }
+            }
+            // Something right at the game's edge is clear of a round corner a little over
+            // half the corner's radius down. The part of the corner above the view does not count.
+            int gap = Math.round(Math.max(0, radius - position[1]) * 0.6f);
+            if (gap <= 0) {
+                gap = Math.round(DEFAULT_TOP_GAP_DP * view.getResources().getDisplayMetrics().density);
+            }
+            view.evaluateJavascript("(" + topGapScript + ")(" + gap + "," + cutouts + ");", null);
+        } catch (IOException | RuntimeException e) {
+            // the game simply stays where it was
+        }
+    }
+
+    private static String readAsset(Context context, String name) throws IOException {
+        InputStream in = context.getAssets().open(name);
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = in.read(buffer)) != -1) {
+                out.write(buffer, 0, count);
+            }
+            return out.toString("UTF-8");
+        } finally {
+            in.close();
         }
     }
 
@@ -302,7 +432,7 @@ public final class SaveSync {
             this.activity = activity;
             this.entry = entry;
             this.title = entry == ENTRY_COPY_STARTERS ? "Copy Pokémon caught"
-                    : entry == ENTRY_RESTORE ? "Restore backup" : "Sync saves";
+                    : entry == ENTRY_RESTORE ? "Restore backup" : entry == ENTRY_TIPS ? "Before you play" : "Sync saves";
             this.backupDir = new File(activity.getFilesDir(), "savesync-backups");
             this.clientId = gameClientId;
         }
@@ -313,11 +443,40 @@ public final class SaveSync {
         }
 
         void start() {
-            if (entry == ENTRY_RESTORE) {
+            if (entry == ENTRY_TIPS) {
+                showTip(0);
+            } else if (entry == ENTRY_RESTORE) {
                 offerBackups();
             } else {
                 beginCheck();
             }
+        }
+
+        // ---- Tips ----
+
+        /**
+         * One page of the tips. When the app opens, any page can switch them off for good;
+         * opened from the Sync saves menu, that button leads back to the menu instead.
+         */
+        private void showTip(final int page) {
+            boolean last = page == TIPS.length - 1;
+            boolean fromMenu = entry != ENTRY_TIPS;
+            present("Tip " + (page + 1) + " of " + TIPS.length + "\n\n" + TIPS[page],
+                    new String[] {
+                        last ? null : "Next",
+                        page > 0 ? "Back" : null,
+                        fromMenu ? "Back to the menu" : "Don't show again"},
+                    new Runnable[] {
+                        () -> showTip(page + 1),
+                        () -> showTip(page - 1),
+                        fromMenu ? this::showMenu : this::hideTips},
+                    last ? "Done" : "Close");
+        }
+
+        private void hideTips() {
+            preferences(activity).edit().putBoolean(TIPS_HIDDEN, true).apply();
+            Toast.makeText(activity, "The tips stay under Sync saves, Show tips", Toast.LENGTH_LONG).show();
+            close();
         }
 
         /** The check at a game's start. See checkAtStart. */
@@ -648,12 +807,14 @@ public final class SaveSync {
                         anything ? "Recommended sync" : null,
                         "Copy online to offline...",
                         "Copy offline to online...",
-                        "Show log"},
+                        "Show log",
+                        "Show tips"},
                     new Runnable[] {
                         () -> confirmRecommended(recommended),
                         () -> chooseParts(DOWN),
                         () -> chooseParts(UP),
-                        this::showLog},
+                        this::showLog,
+                        () -> showTip(0)},
                     "Close");
         }
 
@@ -1272,7 +1433,12 @@ public final class SaveSync {
                 }
             });
             dialog = next;
-            next.show();
+            try {
+                next.show();
+            } catch (RuntimeException e) {
+                close(); // the activity has no window to show a dialog in
+                return null;
+            }
             if (previous != null) {
                 previous.dismiss();
             }
