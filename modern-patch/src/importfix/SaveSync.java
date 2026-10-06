@@ -6,13 +6,11 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
-import android.view.DisplayCutout;
 import android.view.RoundedCorner;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
@@ -68,7 +66,7 @@ import java.util.Locale;
  * explain when to sync, how to get the offline game, and what the drawer's tools are.
  *
  * In the game's own page, a small gap at the top keeps the game clear of rounded
- * screen corners and shows the time (assets/savesync/topgap.js).
+ * screen corners (assets/savesync/topgap.js).
  *
  * "Copy Pokémon caught" puts a text list of the Pokémon usable as starters on the
  * clipboard.
@@ -179,7 +177,7 @@ public final class SaveSync {
                 + "Copy Pokémon caught: your starters as text on the clipboard.\n"
                 + "Sync saves: moves progress between online and offline.\n"
                 + "Restore backup: puts back what a sync replaced.\n"
-                + "The clock above the game: hold it to change the size of the gap at the top.",
+                + "The gap above the game: hold a finger on it to change its size.",
     };
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
@@ -248,10 +246,7 @@ public final class SaveSync {
         }
     }
 
-    /**
-     * Runs topgap.js in the game's page: a gap above the game, sized from the screen's
-     * corner radius, with a clock in it that keeps clear of camera cutouts.
-     */
+    /** Runs topgap.js in the game's page: a gap above the game, sized from the screen's corner radius. */
     private static void applyTopGap(WebView view) {
         try {
             if (topGapScript == null) {
@@ -260,20 +255,12 @@ public final class SaveSync {
             int[] position = new int[2];
             view.getLocationInWindow(position);
             float radius = 0;
-            JSONArray cutouts = new JSONArray();
             WindowInsets insets = view.getRootWindowInsets();
             if (insets != null) {
                 if (Build.VERSION.SDK_INT >= 31) {
                     RoundedCorner left = insets.getRoundedCorner(RoundedCorner.POSITION_TOP_LEFT);
                     RoundedCorner right = insets.getRoundedCorner(RoundedCorner.POSITION_TOP_RIGHT);
                     radius = Math.max(left == null ? 0 : left.getRadius(), right == null ? 0 : right.getRadius());
-                }
-                DisplayCutout cutout = insets.getDisplayCutout();
-                if (cutout != null) {
-                    for (Rect hole : cutout.getBoundingRects()) {
-                        cutouts.put(new JSONArray().put(hole.left - position[0]).put(hole.top - position[1])
-                                .put(hole.right - position[0]).put(hole.bottom - position[1]));
-                    }
                 }
             }
             // Something right at the game's edge is clear of a round corner a little over
@@ -282,7 +269,7 @@ public final class SaveSync {
             if (gap <= 0) {
                 gap = Math.round(DEFAULT_TOP_GAP_DP * view.getResources().getDisplayMetrics().density);
             }
-            view.evaluateJavascript("(" + topGapScript + ")(" + gap + "," + cutouts + ");", null);
+            view.evaluateJavascript("(" + topGapScript + ")(" + gap + ");", null);
         } catch (IOException | RuntimeException e) {
             // the game simply stays where it was
         }
