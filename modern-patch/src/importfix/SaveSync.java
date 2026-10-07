@@ -1016,6 +1016,10 @@ public final class SaveSync {
                         .append(down ? " goes to offline" : " goes to ONLINE");
                 if (target == null) {
                     out.append(".\n");
+                    if (!down && source.optBoolean("maybeEnded")) {
+                        out.append("WARNING: online was played after this run was last saved here. If it ended")
+                                .append(" or was deleted online, this brings it back.\n");
+                    }
                     continue;
                 }
                 out.append(", replacing ").append(describeSession(target)).append(".\n");
@@ -1862,6 +1866,9 @@ public final class SaveSync {
                 if (ended != null) {
                     out.append("\n    This run already ended ").append(other).append(", at wave ")
                             .append(ended.optInt("wave")).append(".");
+                }
+                if (other != null && session.optBoolean("maybeEnded")) {
+                    out.append("\n    Online was played after this was saved. It may already have ended there.");
                 }
             }
         }

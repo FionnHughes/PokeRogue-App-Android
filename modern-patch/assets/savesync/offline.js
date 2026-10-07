@@ -117,6 +117,14 @@
     }
     return null;
   }
+  // Whether a run that only offline has may already be over online. The online side
+  // has been saved after this run was last saved offline, so online was played since,
+  // and the likeliest reason the run is missing there is that it ended or was deleted
+  // there, on this phone or on another device. Run history cannot always tell: it is
+  // kept per device and never reaches the server. Such a run is not sent online unasked.
+  function mayHaveEndedOnline(mine, theirs, onlineSave) {
+    return !!mine && !theirs && !!onlineSave.exists && !onlineSave.broken && mine.timestamp <= onlineSave.timestamp;
+  }
   // Adds the source's runs to the target's and keeps the newest ones.
   function mergeHistory(sourceText, targetText) {
     var merged = runs(targetText);
@@ -200,7 +208,12 @@
             + ' at wave ' + over.wave + ')');
           continue;
         }
-        if (mine && !theirs) { pick = 'up'; why = 'only offline has one'; }
+        if (mayHaveEndedOnline(mine, theirs, b)) {
+          lines.push('Run in progress, slot ' + (i + 1) + ': left alone. Online was played after this run was last'
+            + ' saved here, so it may already have ended there.');
+          continue;
+        }
+        if (mine && !theirs) { pick = 'up'; why = 'only offline has one, and it was played after online was last saved'; }
         else if (theirs && !mine) { pick = 'down'; why = 'only online has one'; }
         else if (mine && theirs) {
           if (mine.seed === theirs.seed && mine.wave !== theirs.wave) {
@@ -262,12 +275,19 @@
             return session;
           });
         };
+        var onlineSave = summarizeSave(online.save);
+        var mine = describe(local.sessions, online.history);
+        mine.forEach(function(session, slot) {
+          if (session && !session.ended) {
+            session.maybeEnded = mayHaveEndedOnline(session, summarizeSession(online.sessions[slot]), onlineSave);
+          }
+        });
         host.onCompared(JSON.stringify({
           local: summarizeSave(local.save),
-          online: summarizeSave(online.save),
+          online: onlineSave,
           localHistory: summarizeHistory(local.history, online.history),
           onlineHistory: summarizeHistory(online.history, local.history),
-          localSessions: describe(local.sessions, online.history),
+          localSessions: mine,
           onlineSessions: describe(online.sessions, local.history),
           recommended: recommended.plan,
           recommendedLines: recommended.lines
