@@ -39,6 +39,7 @@ DRAWER_ENTRIES = [
     (1, "Copy Pok\\u00e9mon caught", "savesync://starters"),
     (0, "Sync saves", "savesync://menu"),
     (2, "Restore backup", "savesync://restore"),
+    (3, "Screen layout", "savesync://layout"),
 ]
 ORIGINAL_TOOLS = 6
 

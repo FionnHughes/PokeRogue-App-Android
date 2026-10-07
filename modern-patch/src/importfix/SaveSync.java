@@ -65,8 +65,10 @@ import java.util.Locale;
  * The first time the app opens, and until told otherwise, a few pages of tips
  * explain when to sync, how to get the offline game, and what the drawer's tools are.
  *
- * In the game's own page, a small gap at the top keeps the game clear of rounded
- * screen corners (assets/savesync/topgap.js).
+ * "Screen layout" opens an editor on top of the running game: a box that says where
+ * on the screen the game is drawn, one for the phone held upright and one for
+ * sideways (assets/savesync/layout.js). Until one is chosen, the upright game starts
+ * a little below the top, clear of rounded screen corners.
  *
  * "Copy Pokémon caught" puts a text list of the Pokémon usable as starters on the
  * clipboard.
@@ -89,8 +91,9 @@ public final class SaveSync {
     private static final int ENTRY_SYNC = 0;
     private static final int ENTRY_COPY_STARTERS = 1;
     private static final int ENTRY_RESTORE = 2;
+    private static final int ENTRY_LAYOUT = 3;
     /** Not a drawer entry: the tips shown when the app opens. */
-    private static final int ENTRY_TIPS = 3;
+    private static final int ENTRY_TIPS = 100;
 
     /** The game has five slots for runs in progress. */
     private static final int SLOTS = 5;
@@ -180,7 +183,7 @@ public final class SaveSync {
                 + "Copy Pokémon caught: your starters as text on the clipboard.\n"
                 + "Sync saves: moves progress between online and offline.\n"
                 + "Restore backup: puts back what a sync replaced.\n"
-                + "The gap above the game: hold a finger on it to change its size.",
+                + "Screen layout: where the game sits on the screen, upright and sideways. Open it while a game is running.",
     };
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
@@ -194,8 +197,10 @@ public final class SaveSync {
     private static boolean checkedOnline;
     /** The tips are offered once per run of the app. Main thread only. */
     private static boolean tipsOffered;
-    /** The text of assets/savesync/topgap.js, read once. */
-    private static String topGapScript;
+    /** The text of assets/savesync/layout.js, read once. */
+    private static String layoutScript;
+    private static final String LAYOUT = "layout";
+    private static final int MAX_LAYOUT_CHARS = 1000;
 
     private SaveSync() {
     }
@@ -231,7 +236,8 @@ public final class SaveSync {
     /** Hook: where the app configures the game WebView, before it loads anything. */
     public static void attach(WebView gameWebView) {
         gameRef = new WeakReference<WebView>(gameWebView);
-        gameWebView.addJavascriptInterface(new GameBridge(), "saveSyncGame");
+        gameWebView.addJavascriptInterface(
+                new GameBridge(gameWebView.getContext().getApplicationContext()), "saveSyncGame");
         checkedOffline = false;
         checkedOnline = false;
     }
@@ -241,19 +247,22 @@ public final class SaveSync {
         String host = hostOf(url);
         if (host.equals(OFFLINE_HOST)) {
             view.evaluateJavascript(IMPORT_LOG_JS, null);
-            applyTopGap(view);
+            applyLayout(view);
             checkAtStart(OFFLINE_HOST);
         } else if (host.equals(ONLINE_HOST)) {
             view.evaluateJavascript(CLIENT_ID_JS, null);
-            applyTopGap(view);
+            applyLayout(view);
         }
     }
 
-    /** Runs topgap.js in the game's page: a gap above the game, sized from the screen's corner radius. */
-    private static void applyTopGap(WebView view) {
+    /**
+     * Runs layout.js in the game's page with the stored layout, if there is one, and
+     * the top gap to use until there is: sized from the screen's corner radius.
+     */
+    private static void applyLayout(WebView view) {
         try {
-            if (topGapScript == null) {
-                topGapScript = readAsset(view.getContext(), "savesync/topgap.js");
+            if (layoutScript == null) {
+                layoutScript = readAsset(view.getContext(), "savesync/layout.js");
             }
             int[] position = new int[2];
             view.getLocationInWindow(position);
@@ -272,7 +281,14 @@ public final class SaveSync {
             if (gap <= 0) {
                 gap = Math.round(DEFAULT_TOP_GAP_DP * view.getResources().getDisplayMetrics().density);
             }
-            view.evaluateJavascript("(" + topGapScript + ")(" + gap + ");", null);
+            String stored = "null";
+            try {
+                // Only ever a JSON object goes into the page's script.
+                stored = new JSONObject(preferences(view.getContext()).getString(LAYOUT, "")).toString();
+            } catch (JSONException e) {
+                // nothing stored yet
+            }
+            view.evaluateJavascript("(" + layoutScript + ")(" + gap + "," + stored + ");", null);
         } catch (IOException | RuntimeException e) {
             // the game simply stays where it was
         }
@@ -315,6 +331,10 @@ public final class SaveSync {
         if (activity == null || activity.isFinishing()) {
             return;
         }
+        if (entry == ENTRY_LAYOUT) {
+            editLayout(activity);
+            return;
+        }
         if (entry != ENTRY_SYNC && entry != ENTRY_COPY_STARTERS && entry != ENTRY_RESTORE) {
             return;
         }
@@ -326,6 +346,25 @@ public final class SaveSync {
         }
         current = new Session(activity, entry);
         current.start();
+    }
+
+    /** Opens the layout editor in the running game's page. Without a game on screen there is nothing to lay out. */
+    private static void editLayout(final Activity activity) {
+        final Runnable noGame = () -> Toast.makeText(activity,
+                "Start a game first, then open Screen layout from the side menu.", Toast.LENGTH_LONG).show();
+        WebView game = gameRef.get();
+        String host = game == null ? "" : hostOf(game.getUrl());
+        if (game == null || !game.isAttachedToWindow() || !game.isShown()
+                || !(host.equals(OFFLINE_HOST) || host.equals(ONLINE_HOST))) {
+            noGame.run();
+            return;
+        }
+        game.evaluateJavascript("(function() { if (!window.__saveSyncLayout) { return false; }"
+                + " window.__saveSyncLayout.edit(); return true; })()", opened -> {
+                    if (!"true".equals(opened)) {
+                        noGame.run();
+                    }
+                });
     }
 
     /**
@@ -354,8 +393,30 @@ public final class SaveSync {
         current.startQuietly(gameHost);
     }
 
-    /** Receives the online game's client session id from the script in CLIENT_ID_JS. */
+    /**
+     * What the game's page can tell the app: the online game's client session id, from
+     * the script in CLIENT_ID_JS, and the screen layout chosen in layout.js's editor.
+     */
     private static final class GameBridge {
+        private final Context context;
+
+        GameBridge(Context context) {
+            this.context = context;
+        }
+
+        /** Keeps the layout in the app, so the online and the offline game share it. */
+        @JavascriptInterface
+        public void saveLayout(String json) {
+            if (json == null || json.length() > MAX_LAYOUT_CHARS) {
+                return;
+            }
+            try {
+                preferences(context).edit().putString(LAYOUT, new JSONObject(json).toString()).apply();
+            } catch (JSONException e) {
+                // not a layout: keep what was stored
+            }
+        }
+
         @JavascriptInterface
         public void clientId(String id) {
             if (id != null && id.matches("[A-Za-z0-9]{32}") && !id.equals(gameClientId)) {

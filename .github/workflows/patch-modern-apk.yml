@@ -116,7 +116,7 @@ jobs:
           grep -qF 'Limportfix/SaveSync;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$sections/LocalWebViewClient.smali"
           grep -qF 'Limportfix/SaveSync;->onDrawerEntry(I)V' "$sections/ToolsSectionKt.smali"
           # The helper's scripts and name tables must be inside the APK.
-          for script in tables.js starters.js offline.js online.js topgap.js; do
+          for script in tables.js starters.js offline.js online.js layout.js; do
             unzip -l ../OfflineRogue-Modern-importfix.apk | grep -q "assets/savesync/$script"
           done
           grep -qF 'Limportfix/SaveSync;->setActivity(Landroid/app/Activity;)V' verify/smali_classes2/labs/smarty/offlinerogue/MainActivity.smali
@@ -166,4 +166,4 @@ jobs:
             --draft \
             --target "$GITHUB_SHA" \
             --title "Modern app with import fix and online sync (private draft) build ${GITHUB_RUN_NUMBER}, ${GITHUB_SHA::7}" \
-            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix and three drawer entries patched in: Copy Pokemon caught, Sync saves (save data, run history and runs in progress, with a recommended sync and a step-by-step log) and Restore backup. Starting a game also checks quietly whether the other side is ahead and warns if so. Upright, the game sits a little below the top of the screen, and a few tips show when the app opens. The app checks its owner's server for a newer build when it opens and can install it; latest.json describes this build for that server. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."
+            --notes "Personal test build of the Modern (PodarSmarty) app with the save-import fix and three drawer entries patched in: Copy Pokemon caught, Sync saves (save data, run history and runs in progress, with a recommended sync and a step-by-step log) and Restore backup. Starting a game also checks quietly whether the other side is ahead and warns if so. A Screen layout entry places the game on the screen, separately for upright and sideways, and a few tips show when the app opens. The app checks its owner's server for a newer build when it opens and can install it; latest.json describes this build for that server. Untested on real devices until confirmed. Installs over earlier builds from this workflow; uninstall the original Modern app first, because the signature differs. Draft on purpose: not for redistribution."
