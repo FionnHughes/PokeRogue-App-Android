@@ -691,9 +691,13 @@ public final class SaveSync {
             return preferences(activity).getString(HISTORY_CODE, "");
         }
 
-        /** The store's address. A test can point it at a store of its own. */
+        /**
+         * Where the store keeps this account's runs. Each account has its own, so two
+         * people sharing one store and code never get each other's runs. A test can
+         * point this at a store of its own.
+         */
         private String historyStore() {
-            return System.getProperty("importfix.history", BuildInfo.HISTORY_URL);
+            return System.getProperty("importfix.history", BuildInfo.HISTORY_URL) + Uri.encode(onlineUser) + "/";
         }
 
         /**

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Run history sharing
 // @namespace    https://fionnhughes.dev/pr/
-// @version      1.0
+// @version      1.1
 // @description  Shares my finished runs between my devices through my own store.
 // @match        https://pokerogue.net/*
 // @run-at       document-idle
@@ -26,7 +26,8 @@
 (function() {
   'use strict';
 
-  var STORE = GM_getValue('store', 'https://fionnhughes.dev/pr/h/'); // ends in "/"
+  // Ends in "/". Each game account's runs are kept under its name below this address.
+  var STORE = GM_getValue('store', 'https://fionnhughes.dev/pr/h/');
   var GAME_STORAGE_KEY = 'x0i2O7WRiANTqPmZ'; // the passphrase the game uses for what it keeps in the browser
   var PREFIX = 'runHistoryData_';
   var LIMIT = 25; // the game keeps this many finished runs
@@ -94,14 +95,16 @@
     if (!GM_getValue('code', '')) { return Promise.resolve('no code set'); }
     busy = true;
     var user = '';
+    var store = '';
     var mine = {};
     var sent = 0;
     var received = 0;
     return whoAmI().then(function(name) {
       if (!name) { throw new Error('not logged in'); }
       user = name;
+      store = STORE + encodeURIComponent(user) + '/';
       mine = readHistory(user);
-      return request('GET', STORE);
+      return request('GET', store);
     }).then(function(answer) {
       var theirs = JSON.parse(answer.text).runs || [];
       var toSend = Object.keys(mine).filter(function(key) { return isKey(key) && theirs.indexOf(key) < 0; });
@@ -112,11 +115,11 @@
       var merged = {};
       var chain = Promise.resolve();
       toSend.forEach(function(key) {
-        chain = chain.then(function() { return request('PUT', STORE + key, JSON.stringify(mine[key])); })
+        chain = chain.then(function() { return request('PUT', store + key, JSON.stringify(mine[key])); })
           .then(function() { sent++; });
       });
       toFetch.forEach(function(key) {
-        chain = chain.then(function() { return request('GET', STORE + key); })
+        chain = chain.then(function() { return request('GET', store + key); })
           .then(function(run) { merged[key] = JSON.parse(run.text); received++; });
       });
       return chain.then(function() {

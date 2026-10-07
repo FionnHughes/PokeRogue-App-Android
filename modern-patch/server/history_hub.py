@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""A small store for PokéRogue run history, so one player's devices can share it.
+"""A small store for PokéRogue run history, so a player's devices can share it.
 
 The game keeps run history in each browser and never sends it to its server. The
 patched Android app and a userscript in the desktop browser both talk to this
 store: each sends the finished runs the store lacks and fetches the ones it lacks.
 
 One finished run is one JSON object, {"entry": ..., "isVictory": ..., "isFavorite": ...},
-kept under the time the run ended (the key the game itself uses).
+kept under the time the run ended (the key the game itself uses). Each game account
+has its own runs, so two people can use one store without seeing each other's.
 
-  GET /pr/h/         -> {"runs": ["1790000000123", ...]}, newest first
-  GET /pr/h/<key>    -> that run, or 404
-  PUT /pr/h/<key>    -> stores that run; a run already stored is left as it is
+  GET /pr/h/<account>/         -> {"runs": ["1790000000123", ...]}, newest first
+  GET /pr/h/<account>/<key>    -> that run, or 404
+  PUT /pr/h/<account>/<key>    -> stores that run; a run already stored is left as it is
 
 Every request needs "Authorization: Bearer <code>". The code comes from the file
 named in HUB_CODE_FILE (default: code.txt next to the stored runs).
@@ -19,7 +20,7 @@ Meant to sit behind a reverse proxy that serves HTTPS and passes /pr/h/* on.
 Standard library only.
 
 Environment: HUB_DIR (default /var/lib/pr-history), HUB_PORT (default 8791),
-HUB_CODE_FILE, HUB_KEEP (how many runs to keep, default 100).
+HUB_CODE_FILE, HUB_KEEP (how many runs to keep per account, default 100).
 """
 import hmac
 import json
@@ -31,6 +32,7 @@ from pathlib import Path
 
 PREFIX = "/pr/h/"
 KEY = re.compile(r"[0-9]{10,16}")
+ACCOUNT = re.compile(r"[A-Za-z0-9_-]{1,32}")
 MAX_BODY = 512 * 1024
 MIN_CODE = 12
 
@@ -47,9 +49,9 @@ def read_code() -> str:
     return code
 
 
-def stored_keys() -> list:
-    """The keys of the stored runs, newest first."""
-    keys = [p.stem for p in DIR.glob("*.json") if KEY.fullmatch(p.stem)]
+def stored_keys(folder: Path) -> list:
+    """The keys of an account's stored runs, newest first."""
+    keys = [p.stem for p in folder.glob("*.json") if KEY.fullmatch(p.stem)]
     return sorted(keys, key=int, reverse=True)
 
 
@@ -71,58 +73,66 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def key(self):
-        """The run a request names: '' for the list, None if the path is not ours."""
+    def target(self):
+        """What a request names: (the account's folder, the run's key or '' for the list).
+
+        None if the path is not one of ours. Account names that differ only by case are one account.
+        """
         path = self.path.split("?", 1)[0]
         if not path.startswith(PREFIX):
             return None
-        rest = path[len(PREFIX):]
-        return rest if rest == "" or KEY.fullmatch(rest) else None
+        account, slash, key = path[len(PREFIX):].partition("/")
+        if not slash or not ACCOUNT.fullmatch(account) or not (key == "" or KEY.fullmatch(key)):
+            return None
+        return DIR / "accounts" / account.lower(), key
 
     def allowed(self) -> bool:
         given = self.headers.get("Authorization", "")
         return hmac.compare_digest(given.encode(), ("Bearer " + self.server.code).encode())
 
     def do_GET(self) -> None:
-        key = self.key()
-        if key is None:
+        target = self.target()
+        if target is None:
             return self.reply(404)
         if not self.allowed():
             return self.reply(401)
+        folder, key = target
         if key == "":
-            return self.reply(200, json.dumps({"runs": stored_keys()}).encode())
+            return self.reply(200, json.dumps({"runs": stored_keys(folder)}).encode())
         try:
-            self.reply(200, (DIR / f"{key}.json").read_bytes())
+            self.reply(200, (folder / f"{key}.json").read_bytes())
         except FileNotFoundError:
             self.reply(404)
 
     def do_PUT(self) -> None:
-        key = self.key()
+        target = self.target()
         length = int(self.headers.get("Content-Length") or 0)
         # A request turned away before its body is read would leave that body in the
         # connection, to be mistaken for the next request. Such a connection is closed.
         self.close_connection = True
-        if not key:
+        if target is None or not target[1]:
             return self.reply(404)
         if not self.allowed():
             return self.reply(401)
         if length <= 0 or length > MAX_BODY:
             return self.reply(413)
         self.close_connection = False
+        folder, key = target
         body = self.rfile.read(length)
         try:
             if not is_run(json.loads(body)):
                 raise ValueError("not a finished run")
         except (ValueError, UnicodeDecodeError):
             return self.reply(400)
-        target = DIR / f"{key}.json"
-        if not target.exists():
+        stored = folder / f"{key}.json"
+        if not stored.exists():
+            folder.mkdir(parents=True, exist_ok=True)
             # Written under another name first, so a reader never sees half a file.
-            partial = DIR / f"{key}.json.part"
+            partial = folder / f"{key}.json.part"
             partial.write_bytes(body)
-            os.replace(partial, target)
-            for old in stored_keys()[KEEP:]:
-                (DIR / f"{old}.json").unlink(missing_ok=True)
+            os.replace(partial, stored)
+            for old in stored_keys(folder)[KEEP:]:
+                (folder / f"{old}.json").unlink(missing_ok=True)
         self.reply(204)
 
     def log_message(self, pattern, *args) -> None:
@@ -133,7 +143,7 @@ def main() -> None:
     DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     server.code = read_code()
-    print(f"run history store on 127.0.0.1:{PORT}, keeping {KEEP} runs in {DIR}", file=sys.stderr)
+    print(f"run history store on 127.0.0.1:{PORT}, keeping {KEEP} runs per account in {DIR}", file=sys.stderr)
     server.serve_forever()
 
 

@@ -27,7 +27,8 @@ import java.util.Set;
  * the store the finished runs it lacks and fetches the ones the device lacks.
  *
  * A run history is the game's own JSON: an object of finished runs keyed by the
- * time each ended. Nothing here touches Android, so it runs and is tested on a JVM.
+ * time each ended. The store keeps each game account's runs apart, so the address
+ * an exchange is given names the account: ".../h/&lt;account&gt;/". Nothing here touches Android, so it runs and is tested on a JVM.
  */
 final class HistoryHub {
     /** The game keeps this many finished runs (its RUN_HISTORY_LIMIT). */
@@ -57,7 +58,7 @@ final class HistoryHub {
      * Sends the store the runs of `history` it lacks, and fetches the runs that belong
      * among the newest {@link #LIMIT} and that `history` lacks.
      *
-     * @param storeUrl the store's address, ending in "/"
+     * @param storeUrl the address of the account's runs in the store, ending in "/"
      * @param history  a run history as JSON text, "" for none
      */
     static Result exchange(String storeUrl, String code, String history) throws IOException, JSONException {
