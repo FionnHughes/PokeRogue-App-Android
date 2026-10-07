@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Run history sharing
 // @namespace    https://fionnhughes.dev/pr/
-// @version      1.1
+// @version      1.2
 // @description  Shares my finished runs between my devices through my own store.
 // @match        https://pokerogue.net/*
 // @run-at       document-idle
@@ -71,13 +71,16 @@
       .catch(function() { return ''; });
   }
 
+  // The finished runs this browser holds for an account. A history that is there but
+  // cannot be read stops the exchange: carrying on would replace it with the store's runs.
   function readHistory(user) {
+    var kept = localStorage.getItem(PREFIX + user);
+    if (!kept) { return {}; }
     try {
-      var kept = localStorage.getItem(PREFIX + user);
-      var runs = kept ? JSON.parse(CryptoJS.AES.decrypt(kept, GAME_STORAGE_KEY).toString(CryptoJS.enc.Utf8)) : {};
+      var runs = JSON.parse(CryptoJS.AES.decrypt(kept, GAME_STORAGE_KEY).toString(CryptoJS.enc.Utf8));
       return runs && typeof runs === 'object' && !Array.isArray(runs) ? runs : {};
     } catch (e) {
-      return {};
+      throw new Error("this browser's run history could not be read (" + ((e && e.message) || e) + ')');
     }
   }
   function writeHistory(user, runs) {
@@ -99,6 +102,7 @@
     var mine = {};
     var sent = 0;
     var received = 0;
+    var inStore = 0;
     return whoAmI().then(function(name) {
       if (!name) { throw new Error('not logged in'); }
       user = name;
@@ -107,6 +111,7 @@
       return request('GET', store);
     }).then(function(answer) {
       var theirs = JSON.parse(answer.text).runs || [];
+      inStore = theirs.length;
       var toSend = Object.keys(mine).filter(function(key) { return isKey(key) && theirs.indexOf(key) < 0; });
       // Only runs that make it into the newest ones are worth fetching.
       var newest = theirs.concat(toSend).filter(isKey)
@@ -133,7 +138,9 @@
     }).then(function() {
       watched = user;
       lastSeen = localStorage.getItem(PREFIX + user);
-      return received + ' received, ' + sent + ' sent';
+      // The counts say which side had nothing, when nothing moved.
+      return received + ' received, ' + sent + ' sent (account ' + user + ': '
+        + Object.keys(mine).filter(isKey).length + ' runs in this browser, ' + inStore + ' in the store before)';
     }).catch(function(e) {
       return 'failed: ' + ((e && e.message) || e);
     }).then(function(line) {
