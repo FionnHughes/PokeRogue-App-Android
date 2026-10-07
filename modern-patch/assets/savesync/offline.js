@@ -288,6 +288,13 @@
           localHistory: summarizeHistory(local.history, online.history),
           onlineHistory: summarizeHistory(online.history, local.history),
           localSessions: mine,
+          // The finished runs only the offline game has, for the shared run history.
+          localOnlyHistory: (function() {
+            var known = runs(online.history);
+            var mineOnly = runs(local.history);
+            Object.keys(mineOnly).forEach(function(key) { if (key in known) { delete mineOnly[key]; } });
+            return Object.keys(mineOnly).length ? JSON.stringify(mineOnly) : '';
+          })(),
           onlineSessions: describe(online.sessions, local.history),
           recommended: recommended.plan,
           recommendedLines: recommended.lines

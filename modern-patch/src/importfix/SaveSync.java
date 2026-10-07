@@ -23,6 +23,7 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -69,6 +70,12 @@ import java.util.Locale;
  * on the screen the game is drawn, one for the phone held upright and one for
  * sideways (assets/savesync/layout.js). Until one is chosen, the upright game starts
  * a little below the top, clear of rounded screen corners.
+ *
+ * Run history is kept by each browser and never reaches the game's server. With a
+ * code set under "Shared run history", every comparison first exchanges finished
+ * runs with a small store on the owner's server ({@link HistoryHub}), which a script
+ * in the desktop browser does too. A run finished on another device then shows up
+ * here, and its leftover copy on this phone is recognised as ended.
  *
  * "Copy Pokémon caught" puts a text list of the Pokémon usable as starters on the
  * clipboard.
@@ -118,6 +125,8 @@ public final class SaveSync {
     private static final long FETCH_TIMEOUT_MS = 45000;
     private static final long PAGE_TIMEOUT_MS = 15000;
     private static final long UPLOAD_TIMEOUT_MS = 90000;
+    /** The shared run history is an extra: if its store does not answer in this time, the sync goes on without it. */
+    private static final long SHARING_TIMEOUT_MS = 20000;
     private static final int LOG_LIMIT = 6000;
 
     /** The passphrase the game itself uses for what it stores in the browser (its src/constants.ts). */
@@ -140,6 +149,7 @@ public final class SaveSync {
     private static final int LOADING_UPLOAD = 5;
     private static final int UPLOADING = 6;
     private static final int LISTING = 7;
+    private static final int SHARING = 8;
 
     private static final String UPLOAD_NOTE =
             "Sending save data or a run in progress ONLINE is not something PokéRogue supports, so it is at"
@@ -200,6 +210,8 @@ public final class SaveSync {
     /** The text of assets/savesync/layout.js, read once. */
     private static String layoutScript;
     private static final String LAYOUT = "layout";
+    private static final String HISTORY_CODE = "history_code";
+    private static final int MIN_HISTORY_CODE_CHARS = 12;
     private static final int MAX_LAYOUT_CHARS = 1000;
 
     private SaveSync() {
@@ -475,6 +487,12 @@ public final class SaveSync {
         /** True once this session has talked to the server under an id of its own. */
         private boolean tookOverSession;
         private boolean reloadedOnline;
+        /** Whether the shared run history was exchanged in this session, and if not, why it failed. */
+        private boolean shared;
+        private String sharingProblem = "";
+        /** Set before a dialog that needs a box to type in; holds what the box starts with. */
+        private String pendingInput;
+        private EditText inputField;
         /** The game whose start began this session, or null if a drawer entry did. */
         private String startedGame;
         /** While true the session shows nothing, and ends without a word if anything fails. */
@@ -655,8 +673,130 @@ public final class SaveSync {
                 onlineProblem = "The online check gave an answer that could not be read.";
                 log("unreadable answer from the online page");
             }
+            if (knowsHistory() && !historyCode().isEmpty()) {
+                shareHistory();
+            } else {
+                loadOffline();
+            }
+        }
+
+        private void loadOffline() {
             load(OFFLINE_PAGE, LOADING_OFFLINE, PAGE_TIMEOUT_MS,
                     "The offline helper page did not load. Nothing was changed.");
+        }
+
+        // ---- Shared run history ----
+
+        private String historyCode() {
+            return preferences(activity).getString(HISTORY_CODE, "");
+        }
+
+        /** The store's address. A test can point it at a store of its own. */
+        private String historyStore() {
+            return System.getProperty("importfix.history", BuildInfo.HISTORY_URL);
+        }
+
+        /**
+         * Exchanges finished runs with the store, so this phone's online run history
+         * also holds the runs finished on other devices before the two sides are
+         * compared. The store is an extra: if it fails, the sync goes on without it.
+         */
+        private void shareHistory() {
+            step = SHARING;
+            final int turn = ++watch;
+            final String store = historyStore();
+            final String code = historyCode();
+            final String mine = onlineHistory;
+            log("exchanging run history with your other devices");
+            MAIN.postDelayed(() -> {
+                if (!closed && watch == turn) {
+                    log("the shared run history did not answer in time: skipped");
+                    loadOffline();
+                }
+            }, SHARING_TIMEOUT_MS);
+            new Thread(() -> {
+                HistoryHub.Result result = null;
+                String problem = "";
+                try {
+                    result = HistoryHub.exchange(store, code, mine);
+                } catch (Exception e) {
+                    // no connection, a wrong code, or an answer that is not what the store sends
+                    problem = String.valueOf(e.getMessage());
+                }
+                final HistoryHub.Result exchanged = result;
+                final String why = problem;
+                MAIN.post(() -> onShared(turn, exchanged, why));
+            }, "history-exchange").start();
+        }
+
+        private void onShared(int turn, HistoryHub.Result exchanged, String problem) {
+            if (closed || watch != turn) {
+                return; // given up on in the meantime
+            }
+            if (exchanged == null) {
+                sharingProblem = problem;
+                log("shared run history failed: " + problem + ". Carrying on without it.");
+            } else {
+                shared = true;
+                log("shared run history: " + runs(exchanged.received) + " received, " + runs(exchanged.sent) + " sent");
+                if (exchanged.received > 0) {
+                    onlineHistory = exchanged.merged;
+                    try {
+                        // Kept where the online game keeps it, so its Run History screen shows them too.
+                        run("window.__online.storeHistory("
+                                + JSONObject.quote(CryptoJsAes.encrypt(exchanged.merged, GAME_STORAGE_KEY)) + ","
+                                + JSONObject.quote(onlineUser) + ");");
+                    } catch (GeneralSecurityException e) {
+                        log("the received runs could not be stored for the online game");
+                    }
+                }
+            }
+            loadOffline();
+        }
+
+        /** Sends the store the finished runs only the offline game has. Nothing waits for it. */
+        private void shareOfflineRuns(final String runsOnlyOffline) {
+            if (!shared || runsOnlyOffline.isEmpty()) {
+                return;
+            }
+            final String store = historyStore();
+            final String code = historyCode();
+            new Thread(() -> {
+                try {
+                    int sent = HistoryHub.send(store, code, runsOnlyOffline);
+                    logLater("shared run history: " + runs(sent) + " from the offline game sent");
+                } catch (Exception e) {
+                    logLater("the offline game's runs could not be sent to the shared run history: " + e.getMessage());
+                }
+            }, "history-send").start();
+        }
+
+        /** Asks for the code of the run history store. An empty code turns sharing off. */
+        private void askHistoryCode() {
+            pendingInput = historyCode();
+            present("Shared run history\n\n"
+                    + "The game keeps run history on each device only. With a code set here, this app exchanges"
+                    + " finished runs with your own store each time it compares your saves. The script in your"
+                    + " laptop's browser does the same with the same code.\n\n"
+                    + "A run finished on another device then appears in both games here, and a copy of it left"
+                    + " on this phone is recognised as ended.\n\n"
+                    + "Leave the box empty to turn sharing off.",
+                    new String[] {"Save", "Back"},
+                    new Runnable[] {
+                        () -> {
+                            String typed = inputField == null ? "" : inputField.getText().toString().trim();
+                            if (!typed.isEmpty() && typed.length() < MIN_HISTORY_CODE_CHARS) {
+                                Toast.makeText(activity, "The code has at least " + MIN_HISTORY_CODE_CHARS
+                                        + " characters", Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            preferences(activity).edit().putString(HISTORY_CODE, typed).apply();
+                            Toast.makeText(activity, typed.isEmpty() ? "Shared run history is off"
+                                    : "Code saved. It is used from the next sync on.", Toast.LENGTH_LONG).show();
+                            showMenu();
+                        },
+                        this::showMenu},
+                    "Close");
         }
 
         private void readOnline(JSONObject report, String save) {
@@ -735,6 +875,7 @@ public final class SaveSync {
                 return;
             }
             log("comparison done");
+            shareOfflineRuns(compared.optString("localOnlyHistory"));
             if (quiet) {
                 warnIfBehind();
             } else if (restoreId != null) {
@@ -864,7 +1005,10 @@ public final class SaveSync {
             if (knowsHistory()) {
                 message.append("\n\nOnline run history is only what Online mode in this app has recorded.");
             }
-            message.append("\n\nThis app: build ").append(BuildInfo.BUILD).append(".");
+            message.append("\n\nShared run history: ").append(historyCode().isEmpty() ? "off"
+                    : shared ? "on" : sharingProblem.isEmpty() ? "on, not used this time"
+                    : "on, but it failed this time (" + sharingProblem + ")").append(".");
+            message.append("\nThis app: build ").append(BuildInfo.BUILD).append(".");
 
             present(message.toString(),
                     new String[] {
@@ -873,6 +1017,7 @@ public final class SaveSync {
                         "Copy offline to online...",
                         "Show log",
                         "Show tips",
+                        "Shared run history",
                         "Check for updates"},
                     new Runnable[] {
                         () -> confirmRecommended(recommended),
@@ -880,6 +1025,7 @@ public final class SaveSync {
                         () -> chooseParts(UP),
                         this::showLog,
                         () -> showTip(0),
+                        this::askHistoryCode,
                         () -> {
                             close();
                             Updater.checkNow(activity);
@@ -1490,6 +1636,15 @@ public final class SaveSync {
             text.setTextAppearance(android.R.style.TextAppearance_Material_Body1);
             text.setText(message);
             column.addView(text);
+            inputField = null;
+            if (pendingInput != null) {
+                inputField = new EditText(themed);
+                inputField.setSingleLine(true);
+                inputField.setText(pendingInput);
+                column.addView(inputField, new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                pendingInput = null;
+            }
             for (int i = 0; i < labels.length; i++) {
                 if (labels[i] == null) {
                     continue;

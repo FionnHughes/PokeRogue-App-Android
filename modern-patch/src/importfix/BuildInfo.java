@@ -16,6 +16,9 @@ final class BuildInfo {
      */
     static final String UPDATE_URL = "https://fionnhughes.dev/pr/latest.json";
 
+    /** The store that shares run history between the owner's devices (see HistoryHub), ending in "/". */
+    static final String HISTORY_URL = "https://fionnhughes.dev/pr/h/";
+
     private BuildInfo() {
     }
 }

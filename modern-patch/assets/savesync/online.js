@@ -237,6 +237,16 @@
     };
     host.onUploadReady();
   } else {
+    window.__online = {
+      // Run history received from the player's other devices, as the game stores it.
+      storeHistory: function(history, username) {
+        try {
+          if (history && username) { localStorage.setItem(HISTORY_PREFIX + username, history); }
+        } catch (e) {
+          host.log('the received runs could not be stored: ' + problem(e));
+        }
+      }
+    };
     fetchEverything();
   }
 })();
