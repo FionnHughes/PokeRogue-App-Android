@@ -662,14 +662,23 @@ public final class SaveSync {
         private void readOnline(JSONObject report, String save) {
             onlineUser = report.optString("username");
             JSONObject cache = report.optJSONObject("cache");
-            // The online game sends its data to the server only every few minutes and keeps
-            // its own copy in between. A newer copy is what the game would continue from.
-            onlineSave = newer("save data", save, cache == null ? "" : decrypt(cache.optString("save")));
             JSONArray sessions = report.optJSONArray("sessions");
             JSONArray cached = cache == null ? null : cache.optJSONArray("sessions");
+            // The online game sends its data to the server only every few minutes and keeps
+            // its own copies in between. When it loads, it keeps them only if its copy of
+            // the save data is newer than the server's; otherwise it drops them all, because
+            // the account was played somewhere else since. The same rule is followed here,
+            // so a run that ended on another device does not live on in this phone's copy.
+            String cachedSave = cache == null ? "" : decrypt(cache.optString("save"));
+            boolean outdated = !cachedSave.isEmpty() && timestampOf(cachedSave) <= timestampOf(save);
+            if (outdated && count(cached) > 0) {
+                log("the online game's stored runs are older than the server's save data: ignored");
+            }
+            onlineSave = outdated ? save : newer("save data", save, cachedSave);
             for (int slot = 0; slot < SLOTS; slot++) {
-                onlineSessions[slot] = newer("slot " + (slot + 1),
-                        textAt(sessions, slot), decrypt(textAt(cached, slot)));
+                String fromServer = textAt(sessions, slot);
+                onlineSessions[slot] = outdated ? fromServer
+                        : newer("slot " + (slot + 1), fromServer, decrypt(textAt(cached, slot)));
             }
             sessionsKnown = report.optBoolean("sessionsKnown", true);
             if (!sessionsKnown) {
