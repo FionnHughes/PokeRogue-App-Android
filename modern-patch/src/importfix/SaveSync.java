@@ -1835,13 +1835,11 @@ public final class SaveSync {
             JSONObject meta = metaOf(id);
             JSONObject save = meta.optJSONObject("save");
             JSONArray sessions = meta.optJSONArray("sessions");
-            int runs = meta.optInt("runs");
             String message = "Taken: " + formatTime(meta.optLong("created", Backups.timeOf(id)))
                     + "\nFrom: " + meta.optString("origin", "unknown") + ", " + meta.optString("reason", "")
-                    + "\n\nSAVE DATA\n" + (save != null ? describeSave(save) : "Not in this backup.")
-                    + "\n\nRUN HISTORY\n" + (runs > 0 ? runs(runs) : "Not in this backup.")
-                    + "\n\nRUNS IN PROGRESS\n" + (count(sessions) > 0 ? slotLines(sessions, null) : "Not in this backup.")
-                    + "\n\nRestoring replaces only the parts this backup has, and backs those up first.";
+                    + "\n\n" + describeBackup(id, meta)
+                    + "\n\nRestoring replaces only the parts this backup has. What they hold now is backed up first,"
+                    + " so a restore can be undone from this list.";
             final boolean touchesServer = save != null || count(sessions) > 0;
             Runnable toOffline = () -> {
                 restoreId = id;
@@ -1867,6 +1865,31 @@ public final class SaveSync {
                     new String[] {"Restore to offline", "Restore to online", "Back"},
                     new Runnable[] {toOffline, toOnline, this::offerBackups},
                     "Close");
+        }
+
+        /** A backup's contents in words, from its files; the short description if they cannot be read. */
+        private String describeBackup(String id, JSONObject meta) {
+            BackupDetails details = new BackupDetails(tables(activity), SaveSync::formatTime);
+            String save = details.save(Backups.read(backupDir, id, Backups.SAVE));
+            if (save == null && meta.optJSONObject("save") != null) {
+                save = describeSave(meta.optJSONObject("save"));
+            }
+            String history = details.history(Backups.read(backupDir, id, Backups.HISTORY));
+            StringBuilder slots = new StringBuilder();
+            try {
+                JSONArray texts = new JSONArray(Backups.read(backupDir, id, Backups.SESSIONS));
+                for (int slot = 0; slot < SLOTS; slot++) {
+                    String line = details.session(slot, textAt(texts, slot));
+                    if (line != null) {
+                        slots.append(slots.length() == 0 ? "" : "\n").append(line);
+                    }
+                }
+            } catch (JSONException e) {
+                // no runs in progress in this backup
+            }
+            return "SAVE DATA\n" + (save != null ? save : "Not in this backup.")
+                    + "\n\nRUNS IN PROGRESS\n" + (slots.length() > 0 ? slots : "Not in this backup.")
+                    + "\n\nRUN HISTORY\n" + (history != null ? history : "Not in this backup.");
         }
 
         /** Restore to online: the backup takes the place of the offline data in an upload. */
@@ -2484,6 +2507,26 @@ public final class SaveSync {
 
     private static String runs(int count) {
         return count + (count == 1 ? " run" : " runs");
+    }
+
+    private static JSONObject tablesCache;
+
+    /** Species and biome names from tables.js, read once; null if the app lacks it. */
+    private static synchronized JSONObject tables(Context context) {
+        if (tablesCache == null) {
+            try (InputStream in = context.getAssets().open("savesync/tables.js")) {
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                byte[] buffer = new byte[16384];
+                int count;
+                while ((count = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, count);
+                }
+                tablesCache = BackupDetails.tablesFrom(new String(out.toByteArray(), StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                return null;
+            }
+        }
+        return tablesCache;
     }
 
     private static String formatTime(long millis) {
