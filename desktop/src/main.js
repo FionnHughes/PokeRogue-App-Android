@@ -104,7 +104,18 @@ function createWindow() {
   watchKeys(overlay);
   void overlay.webContents.loadFile(path.join(__dirname, 'ui', 'panel.html'));
 
-  win.on('resize', layout);
+  // On Linux, maximizing and full screen do not always send 'resize', and the size
+  // they report can lag behind. Lay out on every such event, again shortly after,
+  // and whenever a quick check finds the size changed.
+  const relayout = () => { layout(); setTimeout(layout, 60); setTimeout(layout, 300); };
+  for (const name of ['resize', 'resized', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen', 'restore']) {
+    win.on(name, relayout);
+  }
+  const sizeCheck = setInterval(() => {
+    if (!win || win.isDestroyed()) { clearInterval(sizeCheck); return; }
+    const { width, height } = win.getContentBounds();
+    if (width + 'x' + height !== laidOut) { layout(); }
+  }, 250);
   win.on('close', () => {
     if (!win.isFullScreen() && !win.isMaximized()) { settings.size = win.getSize(); }
     settings.fullscreen = win.isFullScreen();
@@ -128,9 +139,12 @@ function sheetBounds() {
   return { x: Math.round((width - w) / 2), y: top, width: w, height: height - top, header: 64 };
 }
 
+let laidOut = '';
+
 function layout() {
-  if (!win) { return; }
+  if (!win || win.isDestroyed()) { return; }
   const { width, height } = win.getContentBounds();
+  laidOut = width + 'x' + height;
   game.setBounds({ x: 0, y: 0, width, height });
   overlay.setBounds({ x: 0, y: 0, width, height });
   const sheet = sheetBounds();
@@ -301,20 +315,34 @@ async function readStored(user) {
 }
 
 /** The logged-in account, asked of the game's server with the game's login cookie. */
+/**
+ * The logged-in account. Asked from inside the game's page, the way the game asks:
+ * its login cookie as the Authorization header. The game's server turns away the
+ * same request made from outside a page. If it cannot say, a single account with
+ * stored run history in this game is taken to be the one.
+ */
 async function accountName() {
-  const cookies = await game.webContents.session.cookies.get({ url: GAME_URL, name: 'pokerogue_sessionId' });
-  for (const cookie of cookies) {
-    try {
-      const response = await net.fetch(API_URL + 'account/info', { headers: { Authorization: cookie.value } });
-      if (response.ok) {
-        const info = await response.json();
-        if (info && info.username) { return info.username; }
+  return game.webContents.executeJavaScript(`(async () => {
+    const tokens = [...new Set(document.cookie.split(';').map((c) => c.trim())
+      .filter((c) => c.startsWith('pokerogue_sessionId=')).map((c) => c.slice(20)).filter(Boolean))];
+    for (const token of tokens) {
+      try {
+        const response = await fetch(${JSON.stringify(API_URL)} + 'account/info', { headers: { Authorization: token } });
+        if (response.ok) {
+          const info = await response.json();
+          if (info && info.username) { return info.username; }
+        }
+      } catch (e) {
+        // try the next one
       }
-    } catch (e) {
-      // try the next cookie
     }
-  }
-  return '';
+    const names = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key.startsWith('runHistoryData_') && key !== 'runHistoryData_Guest') { names.push(key.slice(15)); }
+    }
+    return names.length === 1 ? names[0] : '';
+  })()`);
 }
 
 function storeRequest(method, url, body) {
