@@ -1,0 +1,65 @@
+{
+  "name": "pokerogue-desktop",
+  "productName": "PokeRogue Desktop",
+  "version": "1.0.0",
+  "description": "Pok\u00e9Rogue for Linux and Windows with a side panel, tool keys and shared run history",
+  "main": "src/main.js",
+  "license": "MIT",
+  "author": "Fionn Hughes",
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/unit.js",
+    "dist:linux": "electron-builder --linux --publish never",
+    "dist:win": "electron-builder --win --publish never"
+  },
+  "dependencies": {
+    "crypto-js": "4.2.0"
+  },
+  "devDependencies": {
+    "electron": "37.2.0",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "dev.fionnhughes.pr.desktop",
+    "productName": "PokeRogue Desktop",
+    "artifactName": "PokeRogue-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**",
+      "icons/**",
+      "assets/**",
+      "build.json",
+      "package.json",
+      "LICENSE-Admiral-Billy"
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "icon": "icons/PR.png",
+      "category": "Game",
+      "executableName": "pokerogue-desktop"
+    },
+    "appImage": {
+      "artifactName": "PokeRogue.AppImage"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "icons/PR.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "PokeRogue",
+      "artifactName": "PokeRogue-Setup.exe"
+    },
+    "publish": null
+  }
+}

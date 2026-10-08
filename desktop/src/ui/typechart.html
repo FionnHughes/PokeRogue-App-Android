@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
+<title>Type Chart</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #141218; color: #e6e0e9; font: 14px Roboto, "Segoe UI", "Noto Sans", system-ui, sans-serif; }
+  .bar { position: sticky; top: 0; display: flex; gap: 8px; justify-content: center; padding: 8px; background: #141218; z-index: 1; }
+  .bar button { font: inherit; font-weight: 500; height: 32px; padding: 0 16px; border-radius: 8px; border: 1px solid #938f99; background: none; color: #cac4d0; cursor: pointer; }
+  .bar button.on { background: #4a4458; border-color: #4a4458; color: #e8def8; }
+  .wrap { padding: 0 8px 8px; display: flex; justify-content: center; }
+  img { display: block; max-width: 100%; height: auto; cursor: zoom-in; image-rendering: auto; }
+  body.fit img { max-height: calc(100vh - 56px); cursor: zoom-in; }
+  body:not(.fit) img { cursor: zoom-out; }
+</style>
+</head>
+<body class="fit">
+<div class="bar">
+  <button id="tall" class="on">Tall</button>
+  <button id="wide">Wide</button>
+</div>
+<div class="wrap"><img id="chart" src="../../assets/type-chart.png" alt="Type chart"></div>
+<script>
+  const chart = document.getElementById('chart');
+  const pick = (wide) => {
+    chart.src = '../../assets/' + (wide ? 'type-chart-2.png' : 'type-chart.png');
+    document.getElementById('tall').classList.toggle('on', !wide);
+    document.getElementById('wide').classList.toggle('on', wide);
+  };
+  document.getElementById('tall').onclick = () => pick(false);
+  document.getElementById('wide').onclick = () => pick(true);
+  // Click to switch between the whole chart and full width.
+  chart.onclick = () => document.body.classList.toggle('fit');
+</script>
+</body>
+</html>

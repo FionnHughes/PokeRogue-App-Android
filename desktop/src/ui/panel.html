@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; img-src 'self' data:">
+<title>Side panel</title>
+<link rel="stylesheet" href="panel.css">
+</head>
+<body>
+<div id="scrim"></div>
+
+<section id="sheet" hidden>
+  <div class="handle"></div>
+  <div class="bar">
+    <button class="icon" id="nav-back" title="Back"><svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg></button>
+    <button class="icon" id="nav-forward" title="Forward"><svg viewBox="0 0 24 24"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z"/></svg></button>
+    <button class="icon" id="nav-home" title="Home"><svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg></button>
+    <div id="sheet-title"></div>
+    <button class="icon" id="nav-browser" title="Open in your browser"><svg viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg></button>
+    <button class="icon" id="nav-close" title="Close (Esc)"><svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+  </div>
+</section>
+
+<aside id="drawer" hidden>
+  <header>
+    <img src="../../icons/PR-256x256.png" alt="">
+    <div>
+      <div class="title">PokéRogue</div>
+      <div class="sub" id="build"></div>
+    </div>
+  </header>
+
+  <h2>Quick Toggles:</h2>
+  <div class="toggles">
+    <button class="toggle" data-toggle="fullscreen"><span>Fullscreen</span><span class="switch"></span></button>
+    <button class="toggle" data-toggle="muted"><span>Mute game</span><span class="switch"></span></button>
+    <button class="toggle" data-toggle="dark"><span>Darker background</span><span class="switch"></span></button>
+  </div>
+
+  <h2>Tools:</h2>
+  <div id="tools"></div>
+
+  <h2>Run history sharing:</h2>
+  <div class="card">
+    <p id="history-line"></p>
+    <div id="code-edit" hidden>
+      <input id="code" type="text" spellcheck="false" autocomplete="off" placeholder="Code of your store">
+      <p class="hint">The same code as in the phone app. Leave empty to turn sharing off.</p>
+      <p class="error" id="code-error"></p>
+    </div>
+    <div class="actions">
+      <button class="text" id="share-now">Share now</button>
+      <button class="text" id="set-code">Set code</button>
+      <button class="text" id="save-code" hidden>Save</button>
+      <button class="text" id="cancel-code" hidden>Cancel</button>
+    </div>
+  </div>
+
+  <h2>Miscellaneous:</h2>
+  <div class="item keyed" data-target="panel">
+    <button class="main" id="panel-key-row"><span>Open this panel</span></button>
+    <span class="chip" data-chip></span>
+    <button class="icon small" data-edit title="Change the key"><svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg></button>
+  </div>
+  <div class="capture-hint" data-hint-for="panel" hidden></div>
+  <div class="item"><button class="main" id="reload"><span>Reload game</span><span class="aside">F5</span></button></div>
+  <div class="item"><button class="main" id="updates"><span>Check for updates</span></button></div>
+  <p class="status" id="update-line"></p>
+  <div class="item"><button class="main" id="credits-button"><span>Credits</span></button></div>
+  <div class="card" id="credits" hidden>
+    <p>PokéRogue is made by its volunteer team. This is an unofficial client: report problems here, not to them.</p>
+    <p>Built on Admiral-Billy's PokeRogue desktop app (MIT licence). The tools are other people's websites.</p>
+  </div>
+</aside>
+
+<script src="panel.js"></script>
+</body>
+</html>

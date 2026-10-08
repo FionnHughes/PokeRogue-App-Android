@@ -1,0 +1,109 @@
+name: Desktop app
+
+# Builds the desktop app (desktop/) for Linux (AppImage and tar.gz) and Windows
+# (installer), and publishes them with latest.json as a draft release. latest.json
+# and the files go on the update server under /pr/d/, where the app looks for updates.
+
+on:
+  push:
+    branches: [fix/android-save-import]
+    paths:
+      - desktop/**
+      - .github/workflows/desktop.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: --linux AppImage tar.gz
+          - os: windows-latest
+            target: --win nsis
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Check
+        run: npm test
+
+      - name: Stamp the build number
+        run: echo "{ \"build\": ${GITHUB_RUN_NUMBER} }" > build.json
+
+      - name: Build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npx electron-builder ${{ matrix.target }} --publish never
+
+      - name: Keep the files
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: |
+            desktop/dist/PokeRogue.AppImage
+            desktop/dist/*.tar.gz
+            desktop/dist/PokeRogue-Setup.exe
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+
+      - name: Describe the build for the update server
+        run: |
+          cd files
+          mv ./*.tar.gz PokeRogue-linux.tar.gz
+          ls -l
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          def describe(name):
+              data = open(name, "rb").read()
+              return {"file": name, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+          notes = subprocess.run(["git", "log", "-1", "--format=%s"], capture_output=True, text=True).stdout.strip()
+          json.dump({
+              "build": int(os.environ["GITHUB_RUN_NUMBER"]),
+              "notes": notes,
+              "linux": {"appimage": describe("PokeRogue.AppImage"), "tar": describe("PokeRogue-linux.tar.gz")},
+              "windows": {"setup": describe("PokeRogue-Setup.exe")},
+          }, open("latest.json", "w"), indent=1)
+          print(open("latest.json").read())
+          PY
+
+      - name: Publish as a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="desktop-${GITHUB_SHA::7}"
+          gh release list --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft and (.tagName | startswith("desktop-"))) | .tagName' \
+            | while read -r old; do gh release delete "$old" --yes || true; done
+          cd files
+          gh release create "$tag" PokeRogue.AppImage PokeRogue-linux.tar.gz PokeRogue-Setup.exe latest.json \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Desktop app build ${GITHUB_RUN_NUMBER}, ${GITHUB_SHA::7}" \
+            --notes "PokéRogue for Linux and Windows: the online game with a side panel (Tab), tools that open over the game with keys you choose, run history shared through the store, and updates from /pr/d/. Built on Admiral-Billy's desktop app (MIT)."
