@@ -45,7 +45,9 @@ jobs:
         run: npm test
 
       - name: Stamp the build number
-        run: echo "{ \"build\": ${GITHUB_RUN_NUMBER} }" > build.json
+        run: |
+          echo "{ \"build\": ${GITHUB_RUN_NUMBER} }" > build.json
+          cat build.json
 
       - name: Build
         env:
