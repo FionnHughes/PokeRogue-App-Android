@@ -139,6 +139,87 @@ async function check(name, fn) {
     }), /could not be read/);
   });
 
+  // ---- shared settings ----
+  const sync = require('../src/settings-sync');
+  // An in-memory store with the server's rules for settings.
+  function settingsStore() {
+    const files = {};
+    const request = async (method, url, body) => {
+      const path = url.replace('https://x/', '');
+      if (method === 'PUT') {
+        const value = JSON.parse(body);
+        if (path === 'settings' && files.settings && files.settings.updated > value.updated) {
+          return { status: 409, text: JSON.stringify(files.settings) };
+        }
+        files[path] = value;
+        return { status: 204, text: '' };
+      }
+      if (path === 'settings/candidates/') {
+        return { status: 200, text: JSON.stringify({ candidates: Object.keys(files).filter((k) => k.startsWith('settings/candidates/'))
+          .map((k) => ({ device: k.split('/').pop(), from: files[k].from, updated: files[k].updated })) }) };
+      }
+      return path in files ? { status: 200, text: JSON.stringify(files[path]) } : { status: 404, text: '' };
+    };
+    return { files, request };
+  }
+  const laptop = { settings: JSON.stringify({ GAME_SPEED: 5, MASTER_VOLUME: 3, gameVersion: '1.12' }), prLang: 'en' };
+  const phone = { settings: JSON.stringify({ GAME_SPEED: 2, TOUCH_CONTROLS: 1, VIBRATION: 0 }), prLang: 'en' };
+  const ex = (store, device, local, last, changedAt, now) => sync.exchange({
+    request: store.request, store: 'https://x/', device, label: device, local, last, changedAt, now });
+
+  await check('settings: nothing chosen yet, each device leaves a candidate', async () => {
+    const store = settingsStore();
+    assert.strictEqual((await ex(store, 'pc-a', laptop, null, 0, 10)).action, 'choose');
+    assert.strictEqual((await ex(store, 'phone-offline', phone, null, 0, 11)).action, 'choose');
+    const list = await sync.candidates(store.request, 'https://x/');
+    assert.deepStrictEqual(list.map((c) => c.device).sort(), ['pc-a', 'phone-offline']);
+  });
+
+  await check('settings: choosing the laptop\'s, the phone takes them but keeps its touch controls', async () => {
+    const store = settingsStore();
+    await ex(store, 'pc-a', laptop, null, 0, 10);
+    await ex(store, 'phone-offline', phone, null, 0, 11);
+    await sync.choose(store.request, 'https://x/', 'pc-a', 20);
+    const atPhone = await ex(store, 'phone-offline', phone, null, 0, 30);
+    assert.strictEqual(atPhone.action, 'apply');
+    const written = JSON.parse(atPhone.write.settings);
+    assert.strictEqual(written.GAME_SPEED, 5);
+    assert.strictEqual(written.TOUCH_CONTROLS, 1);
+    assert.strictEqual(written.VIBRATION, 0);
+    // after writing, the next exchange has nothing to do
+    const again = await ex(store, 'phone-offline', { ...phone, ...atPhone.write }, atPhone.last, 0, 31);
+    assert.strictEqual(again.action, 'same');
+    const atLaptop = await ex(store, 'pc-a', laptop, null, 0, 32);
+    assert.strictEqual(atLaptop.action, 'same');
+  });
+
+  await check('settings: a change on one device reaches the other', async () => {
+    const store = settingsStore();
+    await ex(store, 'pc-a', laptop, null, 0, 10);
+    await sync.choose(store.request, 'https://x/', 'pc-a', 20);
+    let last = (await ex(store, 'pc-a', laptop, null, 0, 21)).last;
+    const louder = { ...laptop, settings: JSON.stringify({ GAME_SPEED: 5, MASTER_VOLUME: 9 }) };
+    const pushed = await ex(store, 'pc-a', louder, last, 40, 41);
+    assert.strictEqual(pushed.action, 'pushed');
+    const atPhone = await ex(store, 'phone-online', phone, null, 0, 50);
+    assert.strictEqual(atPhone.action, 'apply');
+    assert.strictEqual(JSON.parse(atPhone.write.settings).MASTER_VOLUME, 9);
+  });
+
+  await check('settings: both changed, the later change wins', async () => {
+    const store = settingsStore();
+    await ex(store, 'pc-a', laptop, null, 0, 10);
+    await sync.choose(store.request, 'https://x/', 'pc-a', 20);
+    const lastA = (await ex(store, 'pc-a', laptop, null, 0, 21)).last;
+    const lastB = (await ex(store, 'phone-online', phone, null, 0, 22)).last;
+    const phoneSide = { ...phone, settings: JSON.stringify({ GAME_SPEED: 1, MASTER_VOLUME: 3, TOUCH_CONTROLS: 1 }) };
+    // the phone changed at 30 but only exchanges at 100; the laptop changed at 60
+    await ex(store, 'pc-a', { ...laptop, settings: JSON.stringify({ GAME_SPEED: 4, MASTER_VOLUME: 3 }) }, lastA, 60, 61);
+    const atPhone = await ex(store, 'phone-online', phoneSide, lastB, 30, 100);
+    assert.strictEqual(atPhone.action, 'apply');
+    assert.strictEqual(JSON.parse(atPhone.write.settings).GAME_SPEED, 4);
+  });
+
   console.log(failed ? failed + ' failed' : 'all passed');
   process.exit(failed ? 1 : 0);
 })();

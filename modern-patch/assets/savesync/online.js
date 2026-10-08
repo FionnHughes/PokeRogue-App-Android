@@ -90,9 +90,20 @@
       .catch(function() { return null; });
   }
 
+  // The game's settings, kept as plain JSON and shared with the player's other devices.
+  var SETTINGS_KEYS = ['settings', 'settingsKeyboard', 'settingsGamepad', 'mappingConfigs', 'prLang', 'tutorials', 'seenDialogues'];
+  function readSettings() {
+    var out = {};
+    try {
+      SETTINGS_KEYS.forEach(function(key) { var value = localStorage.getItem(key); if (value !== null) { out[key] = value; } });
+    } catch (e) {}
+    return out;
+  }
+
   function fetchEverything() {
     var report = {
       status: 0, problem: '', username: '', save: '', sessions: ['', '', '', '', ''], sessionsKnown: true, history: '',
+      settings: readSettings(),
       cache: { save: '', sessions: ['', '', '', '', ''] }
     };
     function send() { host.onOnline(JSON.stringify(report)); }
@@ -239,6 +250,17 @@
   } else {
     window.__online = {
       // Run history received from the player's other devices, as the game stores it.
+      // Settings from the player's store; the online game uses them the next time it starts.
+      applySettings: function(values) {
+        try {
+          Object.keys(values || {}).forEach(function(key) {
+            if (SETTINGS_KEYS.indexOf(key) >= 0) { localStorage.setItem(key, String(values[key])); }
+          });
+          host.log('shared settings written for the online game');
+        } catch (e) {
+          host.log('the shared settings could not be written: ' + problem(e));
+        }
+      },
       storeHistory: function(history, username) {
         try {
           if (history && username) { localStorage.setItem(HISTORY_PREFIX + username, history); }

@@ -10,6 +10,9 @@
   let capture = null; // the panel or tool id waiting for a key
   let captureMessage = '';
   let editingCode = false;
+  let chooserOpen = false;
+  let chooserLoaded = false;
+  let shownChoice = false;
 
   function text(el, value) { if (el.textContent !== value) { el.textContent = value; } }
 
@@ -105,6 +108,59 @@
     $('cancel-code').hidden = !editingCode;
     text($('set-code'), state.hasCode ? 'Change code' : 'Set code');
     text($('update-line'), state.update.line || '');
+
+    const share = state.settingsShare || {};
+    text($('settings-line'), state.hasCode ? (share.line || 'Waiting for the first exchange.') : 'Set a code under Run history sharing first.');
+    const showChooser = state.hasCode && (chooserOpen || !!share.choose);
+    $('chooser').hidden = !showChooser;
+    $('show-chooser').hidden = !state.hasCode || showChooser;
+    $('hide-chooser').hidden = !showChooser || !!share.choose;
+    $('apply-settings').hidden = !share.pending;
+    if (showChooser && !chooserLoaded) { void loadCandidates(); }
+    // Opened by itself to ask for the choice: show that part.
+    if (share.choose && state.panelOpen && !shownChoice) {
+      shownChoice = true;
+      $('settings-card').scrollIntoView({ block: 'center' });
+    }
+    text($('backup-line'), (state.backup && state.backup.line) || '');
+  }
+
+  // ---- shared settings ----
+
+  function when(ms) {
+    const d = new Date(ms);
+    return d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ', ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  async function loadCandidates() {
+    chooserLoaded = true;
+    const box = $('candidates');
+    box.textContent = 'Loading...';
+    const answer = await window.app.candidates();
+    box.textContent = '';
+    if (answer.error) { text($('choose-error'), answer.error); return; }
+    text($('choose-error'), '');
+    if (!answer.list.length) { box.textContent = 'No device has shared its settings yet.'; return; }
+    for (const c of answer.list) {
+      const button = document.createElement('button');
+      button.className = 'candidate';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = 'Use: ' + c.from + (c.mine ? ' (this computer)' : '');
+      const at = document.createElement('span');
+      at.className = 'when';
+      at.textContent = 'Shared ' + when(c.updated);
+      button.append(name, at);
+      button.addEventListener('click', async () => {
+        text($('choose-error'), '');
+        const why = await window.app.choose(c.device);
+        if (why) { text($('choose-error'), why); return; }
+        chooserOpen = false;
+        chooserLoaded = false;
+        render();
+      });
+      box.appendChild(button);
+    }
   }
 
   // ---- keys ----
@@ -172,6 +228,9 @@
   $('code').addEventListener('focus', () => window.app.typing(true));
   $('code').addEventListener('blur', () => window.app.typing(false));
   $('share-now').addEventListener('click', () => void window.app.shareNow());
+  $('show-chooser').addEventListener('click', () => { chooserOpen = true; chooserLoaded = false; render(); });
+  $('hide-chooser').addEventListener('click', () => { chooserOpen = false; render(); });
+  $('apply-settings').addEventListener('click', () => void window.app.applySettings());
 
   // ---- everything else ----
 
@@ -200,6 +259,8 @@
       if (capture) { capture = null; captureMessage = ''; }
       if (editingCode) { editingCode = false; window.app.typing(false); }
       $('credits').hidden = true;
+      chooserOpen = false;
+      chooserLoaded = false;
     }
     render();
   });

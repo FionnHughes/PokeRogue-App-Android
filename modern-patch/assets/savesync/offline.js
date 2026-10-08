@@ -51,6 +51,13 @@
     }
     return out;
   }
+  // The game's settings, kept as plain JSON and shared with the player's other devices.
+  var SETTINGS_KEYS = ['settings', 'settingsKeyboard', 'settingsGamepad', 'mappingConfigs', 'prLang', 'tutorials', 'seenDialogues'];
+  function readSettings() {
+    var out = {};
+    SETTINGS_KEYS.forEach(function(key) { var value = localStorage.getItem(key); if (value !== null) { out[key] = value; } });
+    return out;
+  }
   function localSnapshot() {
     var out = emptySnapshot();
     out.save = read(saveKey());
@@ -261,6 +268,18 @@
   var online = emptySnapshot();
 
   window.__sync = {
+    // Settings from the player's store; the game uses them the next time it starts.
+    applySettings: function(values) {
+      try {
+        Object.keys(values || {}).forEach(function(key) {
+          if (SETTINGS_KEYS.indexOf(key) >= 0) { localStorage.setItem(key, String(values[key])); }
+        });
+        host.log('shared settings written for the offline game');
+      } catch (e) {
+        host.log('the shared settings could not be written: ' + String((e && e.message) || e));
+      }
+    },
+
     // onlineSnapshot: what the online page fetched. flags: { canUpload, knowsHistory }.
     compare: function(onlineSnapshot, flags) {
       try {
@@ -296,6 +315,9 @@
             return Object.keys(mineOnly).length ? JSON.stringify(mineOnly) : '';
           })(),
           onlineSessions: describe(online.sessions, local.history),
+          localSettings: readSettings(),
+          // The offline side as it is, for a backup in the player's own store.
+          localSnapshot: local,
           recommended: recommended.plan,
           recommendedLines: recommended.lines
         }));

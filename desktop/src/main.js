@@ -11,6 +11,7 @@ const { spawn } = require('child_process');
 const keys = require('./keys');
 const history = require('./history');
 const updater = require('./updater');
+const settingsSync = require('./settings-sync');
 
 const GAME_URL = process.env.PR_GAME_URL || 'https://pokerogue.net/';
 const API_URL = process.env.PR_API_URL || 'https://api.pokerogue.net/';
@@ -30,7 +31,11 @@ const TOOLS = [
 
 const FIRST_SHARE_MS = 8000;
 const SHARE_EVERY_MS = 180000; // look for runs from other devices
-const WATCH_MS = 15000; // look whether the game has recorded a new run
+const WATCH_MS = 15000; // look whether the game has recorded a new run or changed its settings
+const BACKUP_GAP_MS = 10 * 60000; // at most one backup to the store this often
+// This computer, as the store's settings and backups name it.
+const DEVICE = 'pc-' + (os.hostname().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'computer');
+const DEVICE_LABEL = (process.platform === 'win32' ? 'Windows PC' : 'Linux PC') + ' (' + os.hostname() + ')';
 
 // ---- settings ----
 
@@ -69,6 +74,8 @@ const swallowed = new Set(); // keys whose key-down was taken, so their key-up i
 
 const state = {
   history: { on: false, line: 'Off. Set a code to share finished runs with your phone.' },
+  settings: { line: '', choose: false, pending: false },
+  backup: { line: '' },
   update: { line: '' }
 };
 
@@ -369,7 +376,8 @@ async function shareHistory() {
   try {
     const user = await accountName();
     if (!user) { throw new Error('not logged in'); }
-    const store = STORE_URL + encodeURIComponent(user) + '/';
+    currentUser = user;
+    const store = storeFor(user);
     const result = await history.exchange(store, {
       request: storeRequest,
       readStored: () => readStored(user),
@@ -388,19 +396,152 @@ async function shareHistory() {
   return line;
 }
 
+let currentUser = '';
+
+function storeFor(user) { return STORE_URL + encodeURIComponent(user) + '/'; }
+function clock() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+
+// ---- shared settings ----
+
+let settingsBusy = false;
+let settingsSeen = null; // the game's settings as last looked at, to notice a change
+let settingsChangedAt = 0; // when this computer's change was noticed
+let pendingSettings = null; // shared settings changed elsewhere, waiting for the next start
+let offeredChoice = false;
+
+async function readSettings() {
+  return game.webContents.executeJavaScript(`(() => {
+    const out = {};
+    for (const key of ${JSON.stringify(settingsSync.KEYS)}) { out[key] = localStorage.getItem(key); }
+    return out;
+  })()`);
+}
+
+async function writeSettings(values) {
+  await game.webContents.executeJavaScript(`(() => {
+    const values = ${JSON.stringify(values)};
+    for (const key of Object.keys(values)) { localStorage.setItem(key, values[key]); }
+  })()`);
+}
+
+function rememberSettings(user, last) {
+  settings.sharedSettings = { ...(settings.sharedSettings || {}), [user.toLowerCase()]: last };
+  saveSettings();
+}
+
+/**
+ * Exchanges settings with the store. reason: 'start' (the game just loaded: shared
+ * settings are written and the game reloads to use them), 'watch' (this computer
+ * changed them), 'periodic', 'apply' (the player asked) or 'chosen'.
+ */
+async function shareSettings(reason) {
+  if (!settings.historyCode || settingsBusy) { return; }
+  settingsBusy = true;
+  try {
+    const user = currentUser || await accountName();
+    if (!user) { throw new Error('not logged in'); }
+    currentUser = user;
+    const local = await readSettings();
+    const result = await settingsSync.exchange({
+      request: storeRequest, store: storeFor(user), device: DEVICE, label: DEVICE_LABEL, local,
+      last: (settings.sharedSettings || {})[user.toLowerCase()] || null, changedAt: settingsChangedAt, now: Date.now()
+    });
+    settingsSeen = settingsSync.hash(local);
+    if (result.action === 'choose') {
+      state.settings = { line: 'Not chosen yet. Pick whose settings every device should use.', choose: true, pending: false };
+      if (reason === 'start' && !offeredChoice) {
+        offeredChoice = true;
+        setPanel(true);
+      }
+    } else if (result.action === 'apply' && !['start', 'apply', 'chosen'].includes(reason)) {
+      pendingSettings = result;
+      state.settings = { line: `${result.shared.from} changed the shared settings. They apply the next time the game starts.`, choose: false, pending: true };
+    } else if (result.action === 'apply') {
+      await writeSettings(result.write);
+      rememberSettings(user, result.last);
+      settingsSeen = settingsSync.hash({ ...local, ...result.write });
+      settingsChangedAt = 0;
+      pendingSettings = null;
+      state.settings = { line: `${clock()}: now using the shared settings (from ${result.shared.from}).`, choose: false, pending: false };
+      game.webContents.reload(); // the game reads its settings only when it loads
+    } else {
+      rememberSettings(user, result.last);
+      settingsChangedAt = 0;
+      pendingSettings = null;
+      state.settings = {
+        line: result.action === 'pushed' ? `${clock()}: sent this computer's settings change.` : `Shared settings in use (from ${result.shared.from}).`,
+        choose: false, pending: false
+      };
+    }
+  } catch (e) {
+    state.settings = { ...state.settings, line: `${clock()}: failed, ${(e && e.message) || e}` };
+  }
+  settingsBusy = false;
+  pushState();
+}
+
+// ---- backups to the store ----
+
+let lastBackup = { hash: null, at: 0 };
+
+/** Sends the store a copy of the game's save data, runs in progress and run history, when they changed. */
+async function backupToStore(force) {
+  if (!settings.historyCode || !currentUser) { return; }
+  if (!force && Date.now() - lastBackup.at < BACKUP_GAP_MS) { return; }
+  const user = currentUser;
+  try {
+    const stored = await game.webContents.executeJavaScript(`(() => {
+      const user = ${JSON.stringify(user)};
+      const sessions = [];
+      for (let slot = 0; slot < 5; slot++) { sessions.push(localStorage.getItem('sessionData' + (slot || '') + '_' + user) || ''); }
+      return { save: localStorage.getItem('data_' + user) || '', history: localStorage.getItem('runHistoryData_' + user) || '', sessions };
+    })()`);
+    const payload = {
+      from: DEVICE_LABEL, origin: 'online', account: user,
+      save: history.decryptText(stored.save), history: history.decryptText(stored.history),
+      sessions: stored.sessions.map((s) => history.decryptText(s))
+    };
+    if (!payload.save) { return; } // nothing saved yet in this game
+    const hash = require('crypto').createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+    if (hash === lastBackup.hash) { return; }
+    const made = Date.now();
+    const answer = await storeRequest('PUT', storeFor(user) + 'backups/' + made + '-' + DEVICE, JSON.stringify({ made, ...payload }));
+    if (answer.status < 200 || answer.status >= 300) { throw new Error('the store answered ' + answer.status); }
+    lastBackup = { hash, at: made };
+    state.backup = { line: `${clock()}: save data backed up to your server.` };
+  } catch (e) {
+    state.backup = { line: `${clock()}: backup failed, ${(e && e.message) || e}` };
+  }
+  pushState();
+}
+
+async function shareAll(reason) {
+  await shareHistory();
+  await shareSettings(reason);
+  await backupToStore(reason === 'start');
+}
+
 function scheduleSharing() {
   if (!new URL(game.webContents.getURL() || GAME_URL).href.startsWith(new URL(GAME_URL).origin)) { return; }
   clearTimeout(shareTimer);
   clearInterval(watchTimer);
-  shareTimer = setTimeout(function again() {
-    void shareHistory();
-    shareTimer = setTimeout(again, SHARE_EVERY_MS);
+  shareTimer = setTimeout(() => {
+    void shareAll('start');
+    shareTimer = setTimeout(function again() {
+      void shareAll('periodic');
+      shareTimer = setTimeout(again, SHARE_EVERY_MS);
+    }, SHARE_EVERY_MS);
   }, FIRST_SHARE_MS);
-  // The game records a finished run by rewriting its stored history: the moment to send it.
   watchTimer = setInterval(async () => {
-    if (sharing || !settings.historyCode || !lastStored) { return; }
+    if (!settings.historyCode) { return; }
     try {
-      if ((await readStored(lastStored.user)) !== lastStored.text) { void shareHistory(); }
+      // The game records a finished run by rewriting its stored history: the moment to send it.
+      if (!sharing && lastStored && (await readStored(lastStored.user)) !== lastStored.text) { void shareHistory(); }
+      // A setting changed here: send it.
+      if (!settingsBusy && settingsSeen && settingsSync.hash(await readSettings()) !== settingsSeen) {
+        settingsChangedAt = Date.now();
+        void shareSettings('watch');
+      }
     } catch (e) {
       // the page is reloading
     }
@@ -486,7 +627,7 @@ function snapshot() {
     tools: TOOLS.map((t) => ({ id: t.id, name: t.name, key: keys.label(settings.toolKeys[t.id]) })),
     quick: { fullscreen: !!(win && win.isFullScreen()), muted: !!settings.muted, dark: !!settings.dark },
     hasCode: !!settings.historyCode,
-    history: state.history, update: state.update
+    history: state.history, update: state.update, settingsShare: state.settings, backup: state.backup
   };
 }
 
@@ -511,7 +652,30 @@ ipcMain.handle('ui:setCode', (event, code) => {
   void shareHistory();
   return '';
 });
-ipcMain.handle('ui:shareNow', () => shareHistory());
+ipcMain.handle('ui:shareNow', () => shareAll('periodic'));
+ipcMain.handle('ui:candidates', async () => {
+  try {
+    const user = currentUser || await accountName();
+    if (!user) { return { error: 'Log in to the game first.' }; }
+    currentUser = user;
+    const list = await settingsSync.candidates(storeRequest, storeFor(user));
+    return { list: list.map((c) => ({ ...c, mine: c.device === DEVICE })) };
+  } catch (e) {
+    return { error: (e && e.message) || String(e) };
+  }
+});
+ipcMain.handle('ui:choose', async (event, device) => {
+  try {
+    await settingsSync.choose(storeRequest, storeFor(currentUser), device, Date.now());
+    // This computer's own settings have nothing to apply; another device's need the game reloaded.
+    rememberSettings(currentUser, null);
+    await shareSettings('chosen');
+    return '';
+  } catch (e) {
+    return (e && e.message) || String(e);
+  }
+});
+ipcMain.handle('ui:applySettings', () => shareSettings('apply'));
 ipcMain.handle('ui:checkUpdates', () => { setPanel(false); return checkForUpdates(true); });
 ipcMain.handle('ui:reload', () => { setPanel(false); game.webContents.reload(); });
 ipcMain.handle('ui:nav', (event, action) => {

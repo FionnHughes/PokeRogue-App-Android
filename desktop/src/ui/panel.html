@@ -56,6 +56,22 @@
     </div>
   </div>
 
+  <h2>Settings sharing:</h2>
+  <div class="card" id="settings-card">
+    <p id="settings-line"></p>
+    <div id="chooser" hidden>
+      <p class="hint">Every device that has shared its settings is listed. The one you pick is used on all of them; touch controls and vibration stay as each device has them. Another device shows up here once it has shared (on the phone: open Sync saves).</p>
+      <div id="candidates"></div>
+      <p class="error" id="choose-error"></p>
+    </div>
+    <div class="actions">
+      <button class="text" id="apply-settings" hidden>Apply now (reloads the game)</button>
+      <button class="text" id="show-chooser">Choose settings</button>
+      <button class="text" id="hide-chooser" hidden>Close the list</button>
+    </div>
+  </div>
+  <p class="status" id="backup-line"></p>
+
   <h2>Miscellaneous:</h2>
   <div class="item keyed" data-target="panel">
     <button class="main" id="panel-key-row"><span>Open this panel</span></button>

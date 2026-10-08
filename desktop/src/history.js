@@ -13,6 +13,11 @@ function decrypt(cipher) {
   const runs = JSON.parse(CryptoJS.AES.decrypt(cipher, GAME_STORAGE_KEY).toString(CryptoJS.enc.Utf8));
   return runs && typeof runs === 'object' && !Array.isArray(runs) ? runs : {};
 }
+/** Any text the game stored with its passphrase, decrypted; '' if it cannot be read. */
+function decryptText(cipher) {
+  if (!cipher) { return ''; }
+  try { return CryptoJS.AES.decrypt(cipher, GAME_STORAGE_KEY).toString(CryptoJS.enc.Utf8); } catch (e) { return ''; }
+}
 function encrypt(runs) {
   return CryptoJS.AES.encrypt(JSON.stringify(runs), GAME_STORAGE_KEY).toString();
 }
@@ -71,4 +76,4 @@ async function exchange(store, io) {
   return { received: toFetch.length, sent, inBrowser: Object.keys(mine).filter(isKey).length, inStore: theirs.length };
 }
 
-module.exports = { exchange, encrypt, decrypt, isKey, LIMIT };
+module.exports = { exchange, encrypt, decrypt, decryptText, isKey, LIMIT };

@@ -45,6 +45,7 @@ import java.security.GeneralSecurityException;
 import java.text.DateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 
@@ -211,6 +212,12 @@ public final class SaveSync {
     private static String layoutScript;
     private static final String LAYOUT = "layout";
     private static final String HISTORY_CODE = "history_code";
+    /** The account last read online: the store's backups are listed under it when nothing else is known. */
+    private static final String LAST_USER = "last_online_user";
+    /** Per game side and account, the last settings exchange: {"updated", "hash"}. */
+    private static final String SETTINGS_LAST = "settings_last_";
+    /** Per game side and account, a fingerprint of what was last backed up to the store. */
+    private static final String STORE_BACKUP = "store_backup_";
     private static final int MIN_HISTORY_CODE_CHARS = 12;
     private static final int MAX_LAYOUT_CHARS = 1000;
 
@@ -487,6 +494,10 @@ public final class SaveSync {
         /** True once this session has talked to the server under an id of its own. */
         private boolean tookOverSession;
         private boolean reloadedOnline;
+        /** The online game's settings, key to text, as the online page read them. */
+        private JSONObject onlineSettings;
+        /** What happened to each side's settings in this session, for the menu. */
+        private final java.util.Map<String, String> settingsNotes = new java.util.LinkedHashMap<String, String>();
         /** Whether the shared run history was exchanged in this session, and if not, why it failed. */
         private boolean shared;
         private String sharingProblem = "";
@@ -755,7 +766,8 @@ public final class SaveSync {
                     }
                 }
             }
-            loadOffline();
+            // The online page is still loaded, so shared settings can be written for the online game now.
+            shareSettings("online", onlineSettings, this::loadOffline);
         }
 
         /** Sends the store the finished runs only the offline game has. Nothing waits for it. */
@@ -780,8 +792,8 @@ public final class SaveSync {
             pendingInput = historyCode();
             present("Shared run history\n\n"
                     + "The game keeps run history on each device only. With a code set here, this app exchanges"
-                    + " finished runs with your own store each time it compares your saves. The script in your"
-                    + " laptop's browser does the same with the same code.\n\n"
+                    + " finished runs, and the games' settings, with your own store each time it compares your saves, and"
+                    + " keeps a copy of both games' save data there. The desktop app does the same with the same code.\n\n"
                     + "A run finished on another device then appears in both games here, and a copy of it left"
                     + " on this phone is recognised as ended.\n\n"
                     + "Leave the box empty to turn sharing off.",
@@ -805,6 +817,10 @@ public final class SaveSync {
 
         private void readOnline(JSONObject report, String save) {
             onlineUser = report.optString("username");
+            onlineSettings = report.optJSONObject("settings");
+            if (!onlineUser.isEmpty()) {
+                preferences(activity).edit().putString(LAST_USER, onlineUser).apply();
+            }
             JSONObject cache = report.optJSONObject("cache");
             JSONArray sessions = report.optJSONArray("sessions");
             JSONArray cached = cache == null ? null : cache.optJSONArray("sessions");
@@ -880,14 +896,348 @@ public final class SaveSync {
             }
             log("comparison done");
             shareOfflineRuns(compared.optString("localOnlyHistory"));
-            if (quiet) {
-                warnIfBehind();
-            } else if (restoreId != null) {
-                sendBackupOnline();
-            } else if (entry == ENTRY_COPY_STARTERS) {
-                offerStarterLists();
+            backUpToStore();
+            shareSettings("offline", compared.optJSONObject("localSettings"), () -> {
+                if (quiet) {
+                    warnIfBehind();
+                } else if (restoreId != null) {
+                    sendBackupOnline();
+                } else if (entry == ENTRY_COPY_STARTERS) {
+                    offerStarterLists();
+                } else {
+                    showMenu();
+                }
+            });
+        }
+
+        // ---- Shared settings and backups in the player's store ----
+
+        private String storeFor(String user) {
+            return System.getProperty("importfix.history", BuildInfo.HISTORY_URL) + Uri.encode(user) + "/";
+        }
+
+        private String settingsKey(String side) {
+            return SETTINGS_LAST + side + "_" + onlineUser.toLowerCase(Locale.ROOT);
+        }
+
+        private JSONObject lastSettings(String side) {
+            try {
+                String kept = preferences(activity).getString(settingsKey(side), "");
+                return kept.isEmpty() ? null : new JSONObject(kept);
+            } catch (JSONException e) {
+                return null;
+            }
+        }
+
+        /** Settings are shared during Sync saves only: the games read them when they start. */
+        private boolean sharesSettings() {
+            return !quiet && restoreId == null && entry == ENTRY_SYNC && knowsHistory() && !historyCode().isEmpty();
+        }
+
+        /**
+         * Exchanges one game's settings with the store, then carries on with next. When the
+         * shared settings win, they are written by the helper page of that game's origin,
+         * which must be the page loaded at the time. The store is an extra: if it fails,
+         * the sync goes on without it.
+         */
+        private void shareSettings(final String side, final JSONObject local, final Runnable next) {
+            if (!sharesSettings() || local == null) {
+                next.run();
+                return;
+            }
+            final int before = step;
+            step = SHARING;
+            final int turn = ++watch;
+            final String store = historyStore();
+            final String code = historyCode();
+            final JSONObject last = lastSettings(side);
+            log("exchanging the " + side + " game's settings with your other devices");
+            MAIN.postDelayed(() -> {
+                if (!closed && watch == turn) {
+                    watch++;
+                    step = before;
+                    log("the shared settings did not answer in time: skipped");
+                    next.run();
+                }
+            }, SHARING_TIMEOUT_MS);
+            new Thread(() -> {
+                SharedStore.Result result = null;
+                String problem = "";
+                try {
+                    result = SharedStore.exchange(store, code, "phone-" + side, "Phone (" + side + ")", local, last, 0,
+                            System.currentTimeMillis());
+                } catch (Exception e) {
+                    problem = String.valueOf(e.getMessage());
+                }
+                final SharedStore.Result exchanged = result;
+                final String why = problem;
+                MAIN.post(() -> {
+                    if (closed || watch != turn) {
+                        return; // given up on in the meantime
+                    }
+                    watch++;
+                    step = before;
+                    onSettingsShared(side, exchanged, why);
+                    next.run();
+                });
+            }, "settings-exchange").start();
+        }
+
+        private void onSettingsShared(String side, SharedStore.Result result, String problem) {
+            if (result == null) {
+                settingsNotes.put(side, "failed (" + problem + ")");
+                log("shared settings failed: " + problem + ". Carrying on without them.");
+                return;
+            }
+            if (result.last != null) {
+                preferences(activity).edit().putString(settingsKey(side), result.last.toString()).apply();
+            }
+            if (SharedStore.CHOOSE.equals(result.action)) {
+                settingsNotes.put(side, "not chosen yet. Tap Shared settings to pick whose to use");
+                log("shared settings: none chosen yet; the " + side + " game's are offered as a choice");
+            } else if (SharedStore.APPLY.equals(result.action)) {
+                run(("online".equals(side) ? "window.__online" : "window.__sync") + ".applySettings(" + result.write + ");");
+                settingsNotes.put(side, "updated from " + result.from + ", used from the game's next start");
+                log("shared settings from " + result.from + " written for the " + side + " game");
+            } else if (SharedStore.PUSHED.equals(result.action)) {
+                settingsNotes.put(side, "this game's change was sent to your other devices");
+                log("shared settings: the " + side + " game's change was sent");
             } else {
-                showMenu();
+                settingsNotes.put(side, "in use (from " + result.from + ")");
+                log("shared settings: the " + side + " game already uses them");
+            }
+        }
+
+        /** Lets the player pick whose settings every device uses. */
+        private void chooseSettings() {
+            if (historyCode().isEmpty() || !knowsHistory()) {
+                present("Shared settings\n\nSet the code under Shared run history first, and be logged in online.",
+                        new String[] {"Back"}, new Runnable[] {this::showMenu}, "Close");
+                return;
+            }
+            final String store = historyStore();
+            final String code = historyCode();
+            showProgress("Asking your server whose settings it has...", false);
+            new Thread(() -> {
+                JSONArray found = null;
+                String problem = "";
+                try {
+                    found = SharedStore.candidates(store, code);
+                } catch (Exception e) {
+                    problem = String.valueOf(e.getMessage());
+                }
+                final JSONArray list = found;
+                final String why = problem;
+                MAIN.post(() -> {
+                    if (closed) {
+                        return;
+                    }
+                    if (list == null) {
+                        present("Shared settings\n\nYour server could not be asked: " + why,
+                                new String[] {"Back"}, new Runnable[] {this::showMenu}, "Close");
+                        return;
+                    }
+                    String[] labels = new String[list.length() + 1];
+                    Runnable[] actions = new Runnable[list.length() + 1];
+                    for (int i = 0; i < list.length(); i++) {
+                        final JSONObject candidate = list.optJSONObject(i);
+                        labels[i] = "Use: " + candidate.optString("from") + " (shared " + formatTime(candidate.optLong("updated")) + ")";
+                        actions[i] = () -> useSettings(candidate.optString("device"), candidate.optString("from"));
+                    }
+                    labels[list.length()] = "Back";
+                    actions[list.length()] = this::showMenu;
+                    present("Shared settings\n\nPick whose settings every device should use. Touch controls and"
+                            + " vibration stay as each device has them. The games use new settings the next time they start.\n\n"
+                            + "A device is listed once it has shared: the desktop app when it starts, this phone during Sync saves."
+                            + (list.length() == 0 ? "\n\nNo device has shared yet." : ""),
+                            labels, actions, "Close");
+                });
+            }, "settings-candidates").start();
+        }
+
+        private void useSettings(final String device, final String from) {
+            final String store = historyStore();
+            final String code = historyCode();
+            showProgress("Choosing " + from + "'s settings...", false);
+            new Thread(() -> {
+                String problem = "";
+                try {
+                    SharedStore.choose(store, code, device, System.currentTimeMillis());
+                } catch (Exception e) {
+                    problem = String.valueOf(e.getMessage());
+                }
+                final String why = problem;
+                MAIN.post(() -> {
+                    if (closed) {
+                        return;
+                    }
+                    if (!why.isEmpty()) {
+                        present("Shared settings\n\nThe choice could not be stored: " + why,
+                                new String[] {"Back"}, new Runnable[] {this::showMenu}, "Close");
+                        return;
+                    }
+                    // Both games here take the chosen settings in a fresh check.
+                    preferences(activity).edit().remove(settingsKey("online")).remove(settingsKey("offline")).apply();
+                    Toast.makeText(activity, from + "'s settings are now shared. Writing them here...", Toast.LENGTH_LONG).show();
+                    close();
+                    MAIN.post(() -> onDrawerEntry(ENTRY_SYNC));
+                });
+            }, "settings-choose").start();
+        }
+
+        /**
+         * Sends the store a copy of each side as it is now, when it changed since the last
+         * copy: the offline game's data exists nowhere else, and the store keeps it safe.
+         */
+        private void backUpToStore() {
+            JSONObject local = compared.optJSONObject("localSnapshot");
+            compared.remove("localSnapshot");
+            if (historyCode().isEmpty() || !knowsHistory()) {
+                return;
+            }
+            if (local != null) {
+                JSONArray sessions = local.optJSONArray("sessions");
+                snapshotToStore("offline", local.optString("save"), local.optString("history"),
+                        sessions == null ? "" : sessions.toString());
+            }
+            if (canUpload()) {
+                JSONArray sessions = new JSONArray();
+                for (String text : onlineSessions) {
+                    sessions.put(text);
+                }
+                snapshotToStore("online", onlineSave, onlineHistory, sessions.toString());
+            }
+        }
+
+        private void snapshotToStore(final String side, final String save, final String history, final String sessions) {
+            if (save.isEmpty()) {
+                return;
+            }
+            final String key = STORE_BACKUP + side + "_" + onlineUser.toLowerCase(Locale.ROOT);
+            final String fingerprint = SharedStore.sha256(save + "\n" + history + "\n" + sessions);
+            if (fingerprint.equals(preferences(activity).getString(key, ""))) {
+                return;
+            }
+            final String store = historyStore();
+            final String code = historyCode();
+            final String user = onlineUser;
+            new Thread(() -> {
+                try {
+                    SharedStore.putBackup(store, code, "phone-" + side, "Phone (" + side + ")", side, user,
+                            save, history, sessions, System.currentTimeMillis());
+                    preferences(activity).edit().putString(key, fingerprint).apply();
+                    logLater("the " + side + " side was backed up to your server");
+                } catch (Exception e) {
+                    logLater("the " + side + " side could not be backed up to your server: " + e.getMessage());
+                }
+            }, "store-backup").start();
+        }
+
+        /** The backups in the store, for the account last read online. */
+        private void offerStoreBackups() {
+            final String user = onlineUser.isEmpty() ? preferences(activity).getString(LAST_USER, "") : onlineUser;
+            final String code = historyCode();
+            if (code.isEmpty() || user.isEmpty()) {
+                present("Backups on your server\n\nSet the code under Sync saves, Shared run history, and open Sync saves"
+                        + " once while logged in online, so this app knows your account.",
+                        new String[] {"Back"}, new Runnable[] {this::offerBackups}, "Close");
+                return;
+            }
+            final String store = storeFor(user);
+            showProgress("Asking your server for backups...", false);
+            new Thread(() -> {
+                JSONArray found = null;
+                String problem = "";
+                try {
+                    found = SharedStore.backups(store, code);
+                } catch (Exception e) {
+                    problem = String.valueOf(e.getMessage());
+                }
+                final JSONArray list = found;
+                final String why = problem;
+                MAIN.post(() -> {
+                    if (closed) {
+                        return;
+                    }
+                    if (list == null || list.length() == 0) {
+                        present("Backups on your server\n\n" + (list == null ? "Your server could not be asked: " + why
+                                : "None yet for " + user + "."), new String[] {"Back"}, new Runnable[] {this::offerBackups}, "Close");
+                        return;
+                    }
+                    String[] labels = new String[list.length() + 1];
+                    Runnable[] actions = new Runnable[list.length() + 1];
+                    for (int i = 0; i < list.length(); i++) {
+                        final JSONObject backup = list.optJSONObject(i);
+                        labels[i] = formatTime(backup.optLong("made")) + ", " + deviceName(backup.optString("from"))
+                                + " (" + Math.max(1, backup.optLong("size") / 1024) + " KB)";
+                        actions[i] = () -> takeStoreBackup(store, code, backup.optString("id"));
+                    }
+                    labels[list.length()] = "Back";
+                    actions[list.length()] = this::offerBackups;
+                    present("Backups on your server for " + user + ", newest first. Picking one copies it to this phone,"
+                            + " where you can restore it.", labels, actions, "Close");
+                });
+            }, "store-backups").start();
+        }
+
+        /** Copies one of the store's backups into this phone's backups and offers it for restoring. */
+        private void takeStoreBackup(final String store, final String code, final String id) {
+            showProgress("Fetching the backup from your server...", false);
+            new Thread(() -> {
+                JSONObject found = null;
+                String problem = "";
+                try {
+                    found = SharedStore.backup(store, code, id);
+                } catch (Exception e) {
+                    problem = String.valueOf(e.getMessage());
+                }
+                final JSONObject backup = found;
+                final String why = problem;
+                MAIN.post(() -> {
+                    if (closed) {
+                        return;
+                    }
+                    String copied = backup == null ? null : copyStoreBackup(backup);
+                    if (copied == null) {
+                        present("Backups on your server\n\n" + (backup == null ? "The backup could not be fetched: " + why
+                                : "The backup could not be kept on this phone."),
+                                new String[] {"Back"}, new Runnable[] {this::offerStoreBackups}, "Close");
+                        return;
+                    }
+                    offerBackup(copied);
+                });
+            }, "store-backup-fetch").start();
+        }
+
+        private String copyStoreBackup(JSONObject backup) {
+            try {
+                String save = backup.optString("save");
+                String history = backup.optString("history");
+                JSONArray stored = backup.optJSONArray("sessions");
+                JSONArray texts = new JSONArray();
+                JSONArray summaries = new JSONArray();
+                boolean anySession = false;
+                for (int slot = 0; slot < SLOTS; slot++) {
+                    String text = stored == null ? "" : stored.optString(slot, "");
+                    texts.put(text);
+                    JSONObject summary = summarizeSession(text);
+                    summaries.put(summary == null ? JSONObject.NULL : summary);
+                    anySession |= summary != null;
+                }
+                int runCount = HistoryHub.runs(history).length();
+                JSONObject meta = new JSONObject();
+                meta.put("created", backup.optLong("made"));
+                meta.put("origin", "online".equals(backup.optString("origin")) ? "online" : "offline");
+                meta.put("reason", "from your server (" + backup.optString("from") + ")");
+                if (!save.isEmpty()) {
+                    meta.put("save", summarizeSave(save));
+                }
+                meta.put("runs", runCount);
+                meta.put("sessions", summaries);
+                return Backups.write(backupDir, meta.optString("origin"), meta.toString(), save,
+                        runCount > 0 ? history : "", anySession ? texts.toString() : "");
+            } catch (JSONException e) {
+                return null;
             }
         }
 
@@ -1012,6 +1362,9 @@ public final class SaveSync {
             message.append("\n\nShared run history: ").append(historyCode().isEmpty() ? "off"
                     : shared ? "on" : sharingProblem.isEmpty() ? "on, not used this time"
                     : "on, but it failed this time (" + sharingProblem + ")").append(".");
+            for (java.util.Map.Entry<String, String> note : settingsNotes.entrySet()) {
+                message.append("\nShared settings, ").append(note.getKey()).append(": ").append(note.getValue()).append(".");
+            }
             message.append("\nThis app: build ").append(BuildInfo.BUILD).append(".");
 
             present(message.toString(),
@@ -1022,6 +1375,7 @@ public final class SaveSync {
                         "Show log",
                         "Show tips",
                         "Shared run history",
+                        historyCode().isEmpty() || !knowsHistory() ? null : "Shared settings",
                         "Check for updates"},
                     new Runnable[] {
                         () -> confirmRecommended(recommended),
@@ -1030,6 +1384,7 @@ public final class SaveSync {
                         this::showLog,
                         () -> showTip(0),
                         this::askHistoryCode,
+                        this::chooseSettings,
                         () -> {
                             close();
                             Updater.checkNow(activity);
@@ -1456,19 +1811,24 @@ public final class SaveSync {
 
         private void offerBackups() {
             final List<String> ids = Backups.ids(backupDir);
-            if (ids.isEmpty()) {
-                present("No backups yet.\n\nOne is made automatically before a sync or a restore replaces"
-                        + " anything.", new String[0], new Runnable[0], "Close");
-                return;
+            // With a store, its backups come first: they hold copies from every device.
+            boolean store = !historyCode().isEmpty();
+            int first = store ? 1 : 0;
+            String[] labels = new String[ids.size() + first];
+            Runnable[] actions = new Runnable[ids.size() + first];
+            if (store) {
+                labels[0] = "Backups on your server...";
+                actions[0] = this::offerStoreBackups;
             }
-            String[] labels = new String[ids.size()];
-            Runnable[] actions = new Runnable[ids.size()];
-            for (int i = 0; i < labels.length; i++) {
+            for (int i = 0; i < ids.size(); i++) {
                 final String id = ids.get(i);
-                labels[i] = backupLabel(id, metaOf(id));
-                actions[i] = () -> offerBackup(id);
+                labels[i + first] = backupLabel(id, metaOf(id));
+                actions[i + first] = () -> offerBackup(id);
             }
-            present("Each backup holds what a sync or a restore replaced. Newest first.", labels, actions, "Close");
+            present(ids.isEmpty()
+                    ? "No backups on this phone yet.\n\nOne is made automatically before a sync or a restore replaces anything."
+                    : "Each backup on this phone holds what a sync or a restore replaced. Newest first.",
+                    labels, actions, "Close");
         }
 
         private void offerBackup(final String id) {
@@ -1476,7 +1836,7 @@ public final class SaveSync {
             JSONObject save = meta.optJSONObject("save");
             JSONArray sessions = meta.optJSONArray("sessions");
             int runs = meta.optInt("runs");
-            String message = "Taken: " + formatTime(Backups.timeOf(id))
+            String message = "Taken: " + formatTime(meta.optLong("created", Backups.timeOf(id)))
                     + "\nFrom: " + meta.optString("origin", "unknown") + ", " + meta.optString("reason", "")
                     + "\n\nSAVE DATA\n" + (save != null ? describeSave(save) : "Not in this backup.")
                     + "\n\nRUN HISTORY\n" + (runs > 0 ? runs(runs) : "Not in this backup.")
@@ -1987,6 +2347,70 @@ public final class SaveSync {
         } catch (JSONException e) {
             return 0;
         }
+    }
+
+    /** A save data text described as offline.js does (summarizeSave), for backups copied from the store. */
+    private static JSONObject summarizeSave(String text) {
+        JSONObject out = new JSONObject();
+        try {
+            out.put("exists", true);
+            JSONObject d;
+            try {
+                d = new JSONObject(text);
+            } catch (JSONException e) {
+                out.put("broken", true);
+                return out;
+            }
+            JSONObject dex = d.optJSONObject("dexData");
+            int caught = 0;
+            for (Iterator<String> it = dex == null ? null : dex.keys(); it != null && it.hasNext();) {
+                JSONObject entry = dex.optJSONObject(it.next());
+                Object attr = entry == null ? null : entry.opt("caughtAttr");
+                if (attr != null && !"0".equals(String.valueOf(attr)) && !JSONObject.NULL.equals(attr)) {
+                    caught++;
+                }
+            }
+            JSONObject stats = d.optJSONObject("gameStats");
+            out.put("timestamp", d.optLong("timestamp"));
+            out.put("caught", caught);
+            out.put("playTime", stats == null ? 0 : stats.optLong("playTime"));
+            out.put("profile", d.opt("trainerId") + "/" + d.opt("secretId"));
+            out.put("starters", -1);
+        } catch (JSONException e) {
+            // the summary stays partial
+        }
+        return out;
+    }
+
+    private static final String[] MODES = {"Classic", "Endless", "Spliced Endless", "Daily Run", "Challenge"};
+
+    /** A run in progress described as offline.js does (summarizeSession), or null if there is none. */
+    private static JSONObject summarizeSession(String text) {
+        if (text == null || text.isEmpty()) {
+            return null;
+        }
+        try {
+            JSONObject d = new JSONObject(text);
+            JSONObject out = new JSONObject();
+            int mode = d.optInt("gameMode", -1);
+            out.put("timestamp", d.optLong("timestamp"));
+            out.put("wave", d.optInt("waveIndex"));
+            out.put("seed", d.optString("seed"));
+            JSONArray party = d.optJSONArray("party");
+            out.put("party", party == null ? 0 : party.length());
+            out.put("mode", mode >= 0 && mode < MODES.length ? MODES[mode] : "Run");
+            return out;
+        } catch (JSONException e) {
+            return null;
+        }
+    }
+
+    /** "phone-offline" -> "phone offline", "pc-fionn-arch" -> "PC fionn-arch". */
+    private static String deviceName(String slug) {
+        if (slug.startsWith("pc-")) {
+            return "PC " + slug.substring(3);
+        }
+        return slug.replace('-', ' ');
     }
 
     private static String describeSave(JSONObject summary) {
