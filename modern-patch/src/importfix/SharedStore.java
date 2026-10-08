@@ -135,6 +135,28 @@ final class SharedStore {
         check(request("PUT", store + "settings", code, bytes(shared.toString())));
     }
 
+    // ---- the player's own pages ----
+
+    /** The account's page list, {"updated", "pages": [{"name", "url"}]}, or null if there is none yet. */
+    static JSONObject pages(String store, String code) throws IOException, JSONException {
+        Answer got = request("GET", store + "pages", code, null);
+        if (got.status == 404) {
+            return null;
+        }
+        check(got);
+        return new JSONObject(got.text());
+    }
+
+    /** Stores the page list. Returns null, or the stored list if that one is newer (it stays). */
+    static JSONObject putPages(String store, String code, JSONObject list) throws IOException, JSONException {
+        Answer sent = request("PUT", store + "pages", code, bytes(list.toString()));
+        if (sent.status == 409) {
+            return new JSONObject(sent.text());
+        }
+        check(sent);
+        return null;
+    }
+
     // ---- backups ----
 
     /**

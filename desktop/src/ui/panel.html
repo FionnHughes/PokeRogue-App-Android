@@ -40,6 +40,27 @@
   <h2>Tools:</h2>
   <div id="tools"></div>
 
+  <h2>My pages:</h2>
+  <div id="pages"></div>
+  <div class="card" id="page-form" hidden>
+    <input id="page-url" type="text" spellcheck="false" autocomplete="off" placeholder="https://...">
+    <input id="page-name" type="text" spellcheck="false" autocomplete="off" placeholder="Name in the list (optional)">
+    <p class="error" id="page-error"></p>
+    <div class="actions">
+      <button class="text" id="page-save">Save</button>
+      <button class="text" id="page-remove">Remove</button>
+      <button class="text" id="page-cancel">Cancel</button>
+    </div>
+  </div>
+  <div class="actions-row"><button class="text" id="page-add">Add a page</button></div>
+  <p class="status" id="pages-line"></p>
+
+  <h2>Extras:</h2>
+  <div class="item"><button class="main" id="copy-caught"><span>Copy Pokémon caught</span></button></div>
+  <div class="item"><button class="main" id="copy-team"><span>Copy current team</span></button></div>
+  <div id="team-choices"></div>
+  <p class="status" id="extras-line"></p>
+
   <h2>Run history sharing:</h2>
   <div class="card">
     <p id="history-line"></p>

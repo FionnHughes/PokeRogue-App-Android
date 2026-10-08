@@ -116,7 +116,7 @@ jobs:
           grep -qF 'Limportfix/SaveSync;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V' "$sections/LocalWebViewClient.smali"
           grep -qF 'Limportfix/SaveSync;->onDrawerEntry(I)V' "$sections/ToolsSectionKt.smali"
           # The helper's scripts and name tables must be inside the APK.
-          for script in tables.js starters.js offline.js online.js layout.js; do
+          for script in tables.js starters.js team.js offline.js online.js layout.js; do
             unzip -l ../OfflineRogue-Modern-importfix.apk | grep -q "assets/savesync/$script"
           done
           grep -qF 'Limportfix/SaveSync;->setActivity(Landroid/app/Activity;)V' verify/smali_classes2/labs/smarty/offlinerogue/MainActivity.smali

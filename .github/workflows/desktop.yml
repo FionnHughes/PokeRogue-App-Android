@@ -9,6 +9,9 @@ on:
     branches: [fix/android-save-import]
     paths:
       - desktop/**
+      - modern-patch/assets/savesync/tables.js
+      - modern-patch/assets/savesync/starters.js
+      - modern-patch/assets/savesync/team.js
       - .github/workflows/desktop.yml
   workflow_dispatch:
 

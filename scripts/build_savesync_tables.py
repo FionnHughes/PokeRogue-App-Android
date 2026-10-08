@@ -56,6 +56,8 @@ def main() -> None:
     species = parse_enum(game / "src/enums/species-id.ts", "SpeciesId")
     moves = parse_enum(game / "src/enums/move-id.ts", "MoveId")
     natures = parse_enum(game / "src/enums/nature.ts", "Nature")
+    berries = parse_enum(game / "src/enums/berry-type.ts", "BerryType")
+    types = {m: v for m, v in parse_enum(game / "src/enums/pokemon-type.ts", "PokemonType").items() if v >= 0}
     biome_file = game / "src/enums/biome-id.ts"
     biomes = parse_const(biome_file, "BiomeId") if "export const BiomeId" in biome_file.read_text() \
         else parse_enum(biome_file, "BiomeId")
@@ -78,6 +80,9 @@ def main() -> None:
         "eggMoves": egg_moves,
         # For describing runs in progress in backups.
         "biomes": {value: pretty(name) for name, value in biomes.items()},
+        # For describing held items in "Copy current team".
+        "berries": {value: pretty(name) for name, value in berries.items()},
+        "types": {value: pretty(name) for name, value in types.items()},
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(

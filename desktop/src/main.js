@@ -2,7 +2,8 @@
 // panel like the phone app's (Tab), tools that open over the game, a key per tool,
 // run history shared with the phone through my own store, and updates from my server.
 // Grew out of Admiral-Billy's Pokerogue-App (MIT): the tool list and type charts come from there.
-const { app, BaseWindow, WebContentsView, ipcMain, net, shell, dialog } = require('electron');
+const { app, BaseWindow, WebContentsView, ipcMain, net, shell, dialog, clipboard } = require('electron');
+const vm = require('vm');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -22,12 +23,20 @@ const BUILD = (() => {
 
 const TOOLS = [
   { id: 'wiki', name: 'PokéRogue Wiki', url: 'https://wiki.pokerogue.net/' },
-  { id: 'pokedex', name: 'Pokedex', url: 'https://ydarissep.github.io/PokeRogue-Pokedex' },
+  // The Pokedex the phone app shipped with (ydarissep.github.io) is gone; Sandstorm's SearchDex replaces it.
+  { id: 'pokedex', name: 'Pokedex', url: 'https://sandstormer.github.io/PokeRogue-Dex/' },
   { id: 'typecalc', name: 'Type Calculator', url: 'https://www.pkmn.help' },
   { id: 'teambuilder', name: 'Team Builder', url: 'https://marriland.com/tools/team-builder/' },
   { id: 'smogon', name: 'Smogon', url: 'https://www.smogon.com/dex/sv/pokemon/' },
   { id: 'typechart', name: 'Type Chart', file: path.join(__dirname, 'ui', 'typechart.html') }
 ];
+
+/** The built-in tools and the player's own pages, as one list. */
+function allTools() {
+  return TOOLS.concat(myPages().map((p) => ({ id: pageId(p.url), name: p.name, url: p.url, mine: true })));
+}
+function myPages() { return (settings.pages && Array.isArray(settings.pages.pages)) ? settings.pages.pages : []; }
+function pageId(url) { return 'page-' + require('crypto').createHash('sha1').update(url).digest('hex').slice(0, 10); }
 
 const FIRST_SHARE_MS = 8000;
 const SHARE_EVERY_MS = 180000; // look for runs from other devices
@@ -75,6 +84,8 @@ const swallowed = new Set(); // keys whose key-down was taken, so their key-up i
 const state = {
   history: { on: false, line: 'Off. Set a code to share finished runs with your phone.' },
   settings: { line: '', choose: false, pending: false },
+  pages: { line: '' },
+  extras: { line: '', teams: [] },
   backup: { line: '' },
   update: { line: '' }
 };
@@ -208,7 +219,7 @@ function home(tool) {
 
 /** A tool's key or panel entry: shows the tool, or hides it if it is already showing. */
 function toggleTool(id) {
-  const tool = TOOLS.find((t) => t.id === id);
+  const tool = allTools().find((t) => t.id === id);
   if (!tool) { return; }
   if (sheetTool === id && !panelOpen) {
     sheetTool = null;
@@ -277,7 +288,7 @@ async function gameKeys() {
 /** Binds a key to the panel ('panel') or a tool. null removes a tool's key. Resolves to '' or why not. */
 async function bind(target, binding) {
   const others = [{ name: 'the side panel', id: 'panel', binding: settings.panelKey }]
-    .concat(TOOLS.map((t) => ({ name: t.name, id: t.id, binding: settings.toolKeys[t.id] })))
+    .concat(allTools().map((t) => ({ name: t.name, id: t.id, binding: settings.toolKeys[t.id] })))
     .filter((o) => o.id !== target && o.binding);
   if (binding === null) {
     if (target === 'panel') { return 'The side panel needs a key.'; }
@@ -515,8 +526,128 @@ async function backupToStore(force) {
   pushState();
 }
 
+// ---- my pages ----
+
+let pagesBusy = false;
+
+/** Brings the page list up to date with the store: the list changed last wins. */
+async function sharePages() {
+  if (!settings.historyCode || !currentUser || pagesBusy) { return; }
+  pagesBusy = true;
+  try {
+    const store = storeFor(currentUser);
+    const local = settings.pages || { updated: 0, pages: [] };
+    const got = await storeRequest('GET', store + 'pages');
+    const remote = got.status === 200 ? JSON.parse(got.text) : null;
+    if (got.status !== 200 && got.status !== 404) { throw new Error('the store answered ' + got.status); }
+    if (remote && remote.updated > (local.updated || 0)) {
+      settings.pages = remote;
+      saveSettings();
+    } else if ((local.updated || 0) > 0 && (!remote || local.updated > remote.updated)) {
+      const sent = await storeRequest('PUT', store + 'pages', JSON.stringify(local));
+      if (sent.status === 409) { settings.pages = JSON.parse(sent.text); saveSettings(); }
+      else if (sent.status < 200 || sent.status >= 300) { throw new Error('the store answered ' + sent.status); }
+    }
+    state.pages = { line: '' };
+  } catch (e) {
+    state.pages = { line: `${clock()}: sharing the list failed, ${(e && e.message) || e}` };
+  }
+  pagesBusy = false;
+  pushState();
+}
+
+/** Adds or changes (index given) a page, or removes one (entry null). Resolves to '' or why not. */
+async function changePage(index, entry) {
+  if (entry) {
+    if (!/^https?:\/\/[^\s]+\.[^\s]+$/i.test(entry.url || '')) { return 'That is not a web address (https://...).'; }
+    entry = { name: String(entry.name || '').trim() || new URL(entry.url).host, url: entry.url.trim() };
+  }
+  const pages = myPages().slice();
+  if (index === null || index === undefined || index < 0) { pages.push(entry); }
+  else if (entry) { pages[index] = entry; }
+  else {
+    const gone = pages.splice(index, 1)[0];
+    if (gone) {
+      delete settings.toolKeys[pageId(gone.url)];
+      if (sheetTool === pageId(gone.url)) { sheetTool = null; arrange(); }
+    }
+  }
+  settings.pages = { updated: Date.now(), pages };
+  saveSettings();
+  pushState();
+  void sharePages();
+  return '';
+}
+
+// ---- extras: copying to the clipboard ----
+
+let gameTools = null;
+
+/** The phone app's own scripts (tables.js, starters.js, team.js), run here. */
+function vendorTools() {
+  if (!gameTools) {
+    const sandbox = { window: {}, console, atob: (b) => Buffer.from(b, 'base64').toString('latin1') };
+    vm.createContext(sandbox);
+    for (const name of ['tables.js', 'starters.js', 'team.js']) {
+      vm.runInContext(fs.readFileSync(path.join(__dirname, 'vendor', name), 'utf8'), sandbox, { filename: name });
+    }
+    gameTools = sandbox.window;
+  }
+  return gameTools;
+}
+
+async function storedText(key) {
+  return history.decryptText(await game.webContents.executeJavaScript(`localStorage.getItem(${JSON.stringify(key)}) || ''`));
+}
+
+async function copyCaught() {
+  try {
+    const user = currentUser || await accountName();
+    if (!user) { throw new Error('log in to the game first'); }
+    currentUser = user;
+    const save = await storedText('data_' + user);
+    if (!save) { throw new Error('the game has not stored its save data yet'); }
+    const tools = vendorTools();
+    clipboard.writeText(tools.__starterTools.format(save, 'online save'));
+    state.extras = { line: `${clock()}: copied ${tools.__starterTools.count(save)} Pokémon to the clipboard.`, teams: [] };
+  } catch (e) {
+    state.extras = { line: `Could not copy: ${(e && e.message) || e}`, teams: [] };
+  }
+  pushState();
+}
+
+/** Copies a run's team; with several runs and no slot given, offers them instead. */
+async function copyTeam(slot) {
+  try {
+    const user = currentUser || await accountName();
+    if (!user) { throw new Error('log in to the game first'); }
+    currentUser = user;
+    const tools = vendorTools();
+    const runs = [];
+    for (let s = 0; s < 5; s++) {
+      const text = await storedText('sessionData' + (s || '') + '_' + user);
+      if (text) { runs.push({ slot: s, text }); }
+    }
+    if (!runs.length) { throw new Error('no run in progress in this game'); }
+    const pick = slot === undefined || slot === null ? (runs.length === 1 ? runs[0] : null) : runs.find((r) => r.slot === slot);
+    if (!pick) {
+      state.extras = {
+        line: 'Which run? Pick one below.',
+        teams: runs.map((r) => ({ slot: r.slot, label: 'Slot ' + (r.slot + 1) + ': ' + tools.__teamTools.summary(r.text) }))
+      };
+    } else {
+      clipboard.writeText(tools.__teamTools.format(pick.text, 'slot ' + (pick.slot + 1)));
+      state.extras = { line: `${clock()}: copied the team in slot ${pick.slot + 1} to the clipboard.`, teams: [] };
+    }
+  } catch (e) {
+    state.extras = { line: `Could not copy: ${(e && e.message) || e}`, teams: [] };
+  }
+  pushState();
+}
+
 async function shareAll(reason) {
   await shareHistory();
+  await sharePages();
   await shareSettings(reason);
   await backupToStore(reason === 'start');
 }
@@ -620,11 +751,13 @@ function snapshot() {
   return {
     panelOpen, sheetTool, capturing, build: BUILD,
     sheet: win ? sheetBounds() : null,
-    sheetTitle: current ? (current.getTitle() || TOOLS.find((t) => t.id === sheetTool).name) : '',
+    sheetTitle: current ? (current.getTitle() || (allTools().find((t) => t.id === sheetTool) || {}).name || '') : '',
     canBack: current ? current.navigationHistory.canGoBack() : false,
     canForward: current ? current.navigationHistory.canGoForward() : false,
     panelKey: keys.label(settings.panelKey),
     tools: TOOLS.map((t) => ({ id: t.id, name: t.name, key: keys.label(settings.toolKeys[t.id]) })),
+    pages: myPages().map((p) => ({ id: pageId(p.url), name: p.name, url: p.url, key: keys.label(settings.toolKeys[pageId(p.url)]) })),
+    pagesLine: state.pages.line, extras: state.extras,
     quick: { fullscreen: !!(win && win.isFullScreen()), muted: !!settings.muted, dark: !!settings.dark },
     hasCode: !!settings.historyCode,
     history: state.history, update: state.update, settingsShare: state.settings, backup: state.backup
@@ -676,10 +809,13 @@ ipcMain.handle('ui:choose', async (event, device) => {
   }
 });
 ipcMain.handle('ui:applySettings', () => shareSettings('apply'));
+ipcMain.handle('ui:changePage', (event, index, entry) => changePage(index, entry));
+ipcMain.handle('ui:copyCaught', () => copyCaught());
+ipcMain.handle('ui:copyTeam', (event, slot) => copyTeam(slot));
 ipcMain.handle('ui:checkUpdates', () => { setPanel(false); return checkForUpdates(true); });
 ipcMain.handle('ui:reload', () => { setPanel(false); game.webContents.reload(); });
 ipcMain.handle('ui:nav', (event, action) => {
-  const tool = TOOLS.find((t) => t.id === sheetTool);
+  const tool = allTools().find((t) => t.id === sheetTool);
   if (!tool) { return; }
   const contents = toolViews[tool.id].webContents;
   if (action === 'back' && contents.navigationHistory.canGoBack()) { contents.navigationHistory.goBack(); }

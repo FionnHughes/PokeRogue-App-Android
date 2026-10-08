@@ -14,10 +14,11 @@ The Modern app's source is not public, so the fix is applied to its decoded code
      The manifest also gains the REQUEST_INSTALL_PACKAGES permission, which the
      in-app updater needs to hand a downloaded build to Android's installer.
   4. Hooks call importfix.SaveSync (modern-patch/src), which the workflow
-     compiles and adds to the APK as classes3.dex. It adds "Copy Pokémon caught",
-     "Sync saves" and "Restore backup" entries to the drawer's Tools list and an
-     on-screen log for the game's Import Data. Its scripts and name tables are copied into
-     the APK's assets/savesync folder.
+     compiles and adds to the APK as classes3.dex. The drawer gets a "My pages"
+     entry in Tools and a section of its own, "Extras", for this patch's save
+     tools; the Pokedex entry points at a working Pokédex. There is also an
+     on-screen log for the game's Import Data. Its scripts and name tables are
+     copied into the APK's assets/savesync folder.
 """
 import re
 import shutil
@@ -31,17 +32,28 @@ APP = "smali_classes2/labs/smarty/offlinerogue"
 SECTIONS = APP + "/ui/composable/sections"
 TOOL = "Llabs/smarty/offlinerogue/viewmodel/Tool"
 ASSETS = REPO / "modern-patch/assets/savesync"
-# The drawer's Tools list holds a string resource id per entry. The added entries
-# use small numbers no real resource has, and get their labels from code.
+# The drawer's lists hold a string resource id per entry. The added entries use
+# small numbers no real resource has, and get their labels from code.
 # SaveSync.onDrawerEntry receives the same numbers. Listed in drawer order;
 # labels are smali string literals (\\u00e9 is é).
-DRAWER_ENTRIES = [
+TOOLS_ENTRIES = [
+    (4, "My pages", "savesync://pages"),
+]
+# The "Extras" section, a copy of the Tools section with its own list and title.
+EXTRAS_ENTRIES = [
     (1, "Copy Pok\\u00e9mon caught", "savesync://starters"),
+    (5, "Copy current team", "savesync://team"),
     (0, "Sync saves", "savesync://menu"),
     (2, "Restore backup", "savesync://restore"),
     (3, "Screen layout", "savesync://layout"),
 ]
+EXTRAS_TITLE = "Extras:"
+MAX_ENTRY_ID = max(entry[0] for entry in TOOLS_ENTRIES + EXTRAS_ENTRIES)
 ORIGINAL_TOOLS = 6
+# The Pokedex site the app ships with is gone; Sandstorm's SearchDex replaces it.
+OLD_POKEDEX = "https://ydarissep.github.io/PokeRogue-Pokedex"
+NEW_POKEDEX = "https://sandstormer.github.io/PokeRogue-Dex/"
+SECTIONS_CLASS = "Llabs/smarty/offlinerogue/ui/composable/sections/"
 
 # Binary AndroidManifest.xml constants
 RES_STRING_POOL = 0x0001
@@ -284,36 +296,19 @@ def main() -> None:
     )
     activity.write_text(text)
 
+    add_extras_section(root, Path(sys.argv[1]) / APP / "ui/composable/screen")
     patch_tools_list(root)
     patch_launch_mode(Path(sys.argv[1]) / "AndroidManifest.xml")
     add_permission(Path(sys.argv[1]) / "AndroidManifest.xml", INSTALL_PERMISSION)
     shutil.copytree(ASSETS, Path(sys.argv[1]) / "assets/savesync")
-    print("patched the launch mode, the web view hooks, MainActivity and the Tools list")
+    print("patched the launch mode, the web view hooks, MainActivity, the Tools list and the Extras section")
 
 
-def patch_tools_list(root: Path) -> None:
-    """Add this patch's entries at the end of the drawer's Tools list."""
-    tools = root / "ToolsSectionKt.smali"
-    text = tools.read_text()
-
-    # 1. More elements in the static list.
-    array_start = (
-        "    const/4 v0, 0x6\n"
-        "\n"
-        "    .line 59\n"
-        f"    new-array v0, v0, [{TOOL};\n"
-    )
-    text = replace_once(
-        text, array_start, array_start.replace("const/4 v0, 0x6", f"const/16 v0, {hex(ORIGINAL_TOOLS + len(DRAWER_ENTRIES))}"), "Tools array size"
-    )
-    last_entry = (
-        "    const/4 v2, 0x5\n"
-        "\n"
-        "    aput-object v1, v0, v2\n"
-    )
-    sync_entry = last_entry
-    for offset, (title_id, _label, url) in enumerate(DRAWER_ENTRIES):
-        sync_entry += (
+def entry_code(entries, first_index: int) -> str:
+    """Smali that stores one Tool.Website per entry into array v0, from first_index on."""
+    code = ""
+    for offset, (title_id, _label, url) in enumerate(entries):
+        code += (
             "\n"
             + f"    new-instance v1, {TOOL}$Website;\n"
             + "\n"
@@ -323,15 +318,32 @@ def patch_tools_list(root: Path) -> None:
             + "\n"
             + f"    invoke-direct {{v1, v2, v3}}, {TOOL}$Website;-><init>(ILjava/lang/String;)V\n"
             + "\n"
-            + f"    const/16 v2, {hex(ORIGINAL_TOOLS + offset)}\n"
+            + f"    const/16 v2, {hex(first_index + offset)}\n"
             + "\n"
             + "    aput-object v1, v0, v2\n"
         )
-    text = replace_once(text, last_entry, sync_entry, "last Tools entry")
+    return code
 
-    # 2. A tap on either entry closes the drawer and opens its dialog instead of
-    #    the tool sheet. p1 is the tapped Tool, p2 the "close drawer" callback.
-    #    Real title ids are large resource ids, so a small number means one of ours.
+
+ARRAY_START = (
+    "    const/4 v0, 0x6\n"
+    "\n"
+    "    .line 59\n"
+    f"    new-array v0, v0, [{TOOL};\n"
+)
+LAST_ENTRY = (
+    "    const/4 v2, 0x5\n"
+    "\n"
+    "    aput-object v1, v0, v2\n"
+)
+
+
+def patch_taps_and_labels(root: Path, cls: str, entries) -> None:
+    """A tap on one of our entries opens its dialog; our ids get their labels from code."""
+    tools = root / f"{cls}.smali"
+    text = tools.read_text()
+    # p1 is the tapped Tool, p2 the "close drawer" callback. Real title ids are large
+    # resource ids, so a small number means one of ours.
     open_tool = (
         "    invoke-virtual {p0, p1}, Llabs/smarty/offlinerogue/viewmodel/DrawerViewModel;->"
         f"setBottomSheetTool({TOOL};)V\n"
@@ -341,7 +353,7 @@ def patch_tools_list(root: Path) -> None:
         "\n"
         "    move-result v0\n"
         "\n"
-        f"    const/4 v1, {hex(max(entry[0] for entry in DRAWER_ENTRIES))}\n"
+        f"    const/4 v1, {hex(MAX_ENTRY_ID)}\n"
         "\n"
         "    if-gt v0, v1, :not_save_tool\n"
         "\n"
@@ -355,12 +367,11 @@ def patch_tools_list(root: Path) -> None:
         "\n"
         "    :not_save_tool\n"
     ) + open_tool
-    text = replace_once(text, open_tool, open_sync, "tool tap handler")
+    text = replace_once(text, open_tool, open_sync, f"{cls} tap handler")
     tools.write_text(text)
 
-    # 3. The entries' labels: our ids get their text here; every other id is looked up as before.
-    #    v1 holds the title id and v3 receives the label; v3 doubles as scratch for the comparison.
-    label = root / "ToolsSectionKt$ToolsSection$1$1.smali"
+    # v1 holds the title id and v3 receives the label; v3 doubles as scratch for the comparison.
+    label = root / f"{cls}$ToolsSection$1$1.smali"
     text = label.read_text()
     lookup = (
         "    invoke-static {v1, v15, v2}, Landroidx/compose/ui/res/StringResources_androidKt;->"
@@ -368,9 +379,9 @@ def patch_tools_list(root: Path) -> None:
         "\n"
         "    move-result-object v3\n"
     )
-    with_sync_label = ""
-    for title_id, entry_label, _url in DRAWER_ENTRIES:
-        with_sync_label += (
+    with_label = ""
+    for title_id, entry_label, _url in entries:
+        with_label += (
             f"    const/4 v3, {hex(title_id)}\n"
             "\n"
             f"    if-ne v1, v3, :save_tool_not_{title_id}\n"
@@ -381,9 +392,74 @@ def patch_tools_list(root: Path) -> None:
             "\n"
             f"    :save_tool_not_{title_id}\n"
         )
-    with_sync_label += lookup + "\n" + "    :save_tool_label_done\n"
-    text = replace_once(text, lookup, with_sync_label, "tool label lookup")
+    with_label += lookup + "\n" + "    :save_tool_label_done\n"
+    text = replace_once(text, lookup, with_label, f"{cls} label lookup")
     label.write_text(text)
+
+
+def patch_tools_list(root: Path) -> None:
+    """Point the Pokedex entry at a working site and add "My pages" to the end of Tools."""
+    tools = root / "ToolsSectionKt.smali"
+    text = tools.read_text()
+    text = replace_once(text, f'const-string v3, "{OLD_POKEDEX}"', f'const-string v3, "{NEW_POKEDEX}"', "Pokedex address")
+    text = replace_once(
+        text, ARRAY_START,
+        ARRAY_START.replace("const/4 v0, 0x6", f"const/16 v0, {hex(ORIGINAL_TOOLS + len(TOOLS_ENTRIES))}"),
+        "Tools array size")
+    text = replace_once(text, LAST_ENTRY, LAST_ENTRY + entry_code(TOOLS_ENTRIES, ORIGINAL_TOOLS), "last Tools entry")
+    tools.write_text(text)
+    patch_taps_and_labels(root, "ToolsSectionKt", TOOLS_ENTRIES)
+
+
+def add_extras_section(root: Path, screens: Path) -> None:
+    """A second section below Tools, holding only this patch's entries.
+
+    It is a copy of the Tools section's classes (the section, its item and tap
+    lambdas), renamed, with its own list and a title from code. Recomposition then
+    stays inside the copy. The drawer calls it right after Tools, with the same
+    arguments, behind the same kind of divider.
+    """
+    for source in sorted(root.glob("ToolsSectionKt*.smali")):
+        target = root / source.name.replace("ToolsSectionKt", "ExtrasSectionKt", 1)
+        target.write_text(source.read_text().replace(
+            SECTIONS_CLASS + "ToolsSectionKt", SECTIONS_CLASS + "ExtrasSectionKt"))
+
+    extras = root / "ExtrasSectionKt.smali"
+    text = extras.read_text()
+    # The list: only our entries, built where the original six were.
+    begin = text.index(ARRAY_START)
+    end = text.index("    .line 58\n    invoke-static {v0}, Lkotlin/collections/CollectionsKt;->listOf")
+    text = (text[:begin]
+            + f"    const/16 v0, {hex(len(EXTRAS_ENTRIES))}\n\n    new-array v0, v0, [{TOOL};\n"
+            + entry_code(EXTRAS_ENTRIES, 0) + "\n"
+            + text[end:])
+    title = (
+        "    sget v0, Llabs/smarty/offlinerogue/R$string;->tool_title:I\n"
+        "\n"
+        "    invoke-static {v0, v5, v14}, Landroidx/compose/ui/res/StringResources_androidKt;->"
+        "stringResource(ILandroidx/compose/runtime/Composer;I)Ljava/lang/String;\n"
+        "\n"
+        "    move-result-object v11\n"
+    )
+    text = replace_once(text, title, f'    const-string v11, "{EXTRAS_TITLE}"\n', "Extras title")
+    extras.write_text(text)
+    patch_taps_and_labels(root, "ExtrasSectionKt", EXTRAS_ENTRIES)
+
+    drawer = screens / "DrawerScreenKt$DrawerScreen$2.smali"
+    text = drawer.read_text()
+    call = (
+        "    invoke-static/range {v1 .. v6}, " + SECTIONS_CLASS + "ToolsSectionKt;->ToolsSection("
+        "Landroidx/compose/material3/SheetState;Llabs/smarty/offlinerogue/viewmodel/DrawerViewModel;"
+        "Landroidx/compose/material3/DrawerState;Lkotlin/jvm/functions/Function0;"
+        "Landroidx/compose/runtime/Composer;I)V\n"
+    )
+    divider = (
+        "    invoke-static {v14, v7}, Llabs/smarty/offlinerogue/ui/composable/screen/DrawerScreenKt;->"
+        "access$Divider(Landroidx/compose/runtime/Composer;I)V\n"
+    )
+    text = replace_once(text, call, call + "\n" + divider + "\n"
+                        + call.replace("ToolsSectionKt;", "ExtrasSectionKt;"), "drawer's Tools section call")
+    drawer.write_text(text)
 
 
 if __name__ == "__main__":

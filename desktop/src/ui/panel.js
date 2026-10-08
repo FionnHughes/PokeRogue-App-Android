@@ -13,6 +13,8 @@
   let chooserOpen = false;
   let chooserLoaded = false;
   let shownChoice = false;
+  let pagesShown = '';
+  let editingPage = null; // null: no form; -1: adding; n: changing page n
 
   function text(el, value) { if (el.textContent !== value) { el.textContent = value; } }
 
@@ -33,6 +35,45 @@
       hint.dataset.hintFor = tool.id;
       hint.hidden = true;
       box.appendChild(hint);
+    }
+    wireEdits();
+  }
+
+  const REMOVE_ICON = '<svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
+
+  function buildPages() {
+    pagesShown = JSON.stringify(state.pages);
+    const box = $('pages');
+    box.textContent = '';
+    (state.pages || []).forEach((page, index) => {
+      const row = document.createElement('div');
+      row.className = 'item keyed';
+      row.dataset.target = page.id;
+      row.innerHTML = '<button class="main"><span></span></button><span class="chip" data-chip></span>'
+        + '<button class="icon small" data-edit title="Set a key">' + EDIT_ICON + '</button>'
+        + '<button class="icon small remove" title="Change or remove">' + REMOVE_ICON + '</button>';
+      row.querySelector('.main span').textContent = page.name;
+      row.querySelector('.main').title = page.url;
+      row.querySelector('.main').addEventListener('click', () => window.app.tool(page.id));
+      row.querySelector('.remove').addEventListener('click', () => {
+        editingPage = index;
+        $('page-url').value = page.url;
+        $('page-name').value = page.name;
+        text($('page-error'), '');
+        render();
+      });
+      box.appendChild(row);
+      const hint = document.createElement('div');
+      hint.className = 'capture-hint';
+      hint.dataset.hintFor = page.id;
+      hint.hidden = true;
+      box.appendChild(hint);
+    });
+    if (!(state.pages || []).length) {
+      const none = document.createElement('p');
+      none.className = 'status';
+      none.textContent = 'None yet. Your pages open over the game like the tools, and can have keys too.';
+      box.appendChild(none);
     }
     wireEdits();
   }
@@ -67,9 +108,29 @@
 
     text($('build'), 'Desktop' + (state.build ? ', build ' + state.build : ', hand-built copy'));
     if (!$('tools').children.length || $('tools').querySelectorAll('.keyed').length !== state.tools.length) { buildTools(); }
+    if (JSON.stringify(state.pages) !== pagesShown) { buildPages(); }
+    $('page-form').hidden = editingPage === null;
+    $('page-add').hidden = editingPage !== null;
+    $('page-remove').hidden = editingPage === null || editingPage < 0;
+    text($('pages-line'), state.pagesLine || '');
+    text($('extras-line'), (state.extras && state.extras.line) || '');
+    const choices = $('team-choices');
+    const teams = (state.extras && state.extras.teams) || [];
+    if (choices.dataset.shown !== JSON.stringify(teams)) {
+      choices.dataset.shown = JSON.stringify(teams);
+      choices.textContent = '';
+      for (const team of teams) {
+        const button = document.createElement('button');
+        button.className = 'choice';
+        button.textContent = team.label;
+        button.addEventListener('click', () => void window.app.copyTeam(team.slot));
+        choices.appendChild(button);
+      }
+    }
     for (const row of document.querySelectorAll('.keyed')) {
       const target = row.dataset.target;
-      const key = target === 'panel' ? state.panelKey : (state.tools.find((t) => t.id === target) || {}).key;
+      const key = target === 'panel' ? state.panelKey
+        : (state.tools.concat(state.pages || []).find((t) => t.id === target) || {}).key;
       const chip = row.querySelector('[data-chip]');
       const waiting = capture === target;
       text(chip, waiting ? 'Press a key' : (key || 'No key'));
@@ -228,6 +289,38 @@
   $('code').addEventListener('focus', () => window.app.typing(true));
   $('code').addEventListener('blur', () => window.app.typing(false));
   $('share-now').addEventListener('click', () => void window.app.shareNow());
+  $('page-add').addEventListener('click', () => {
+    editingPage = -1;
+    $('page-url').value = 'https://';
+    $('page-name').value = '';
+    text($('page-error'), '');
+    render();
+    $('page-url').focus();
+  });
+  $('page-save').addEventListener('click', async () => {
+    const why = await window.app.changePage(editingPage, { url: $('page-url').value.trim(), name: $('page-name').value.trim() });
+    if (why) { text($('page-error'), why); return; }
+    editingPage = null;
+    window.app.typing(false);
+    render();
+  });
+  $('page-remove').addEventListener('click', async () => {
+    if (editingPage !== null && editingPage >= 0) { await window.app.changePage(editingPage, null); }
+    editingPage = null;
+    window.app.typing(false);
+    render();
+  });
+  $('page-cancel').addEventListener('click', () => {
+    editingPage = null;
+    window.app.typing(false);
+    render();
+  });
+  for (const field of ['page-url', 'page-name']) {
+    $(field).addEventListener('focus', () => window.app.typing(true));
+    $(field).addEventListener('blur', () => window.app.typing(false));
+  }
+  $('copy-caught').addEventListener('click', () => void window.app.copyCaught());
+  $('copy-team').addEventListener('click', () => void window.app.copyTeam(null));
   $('show-chooser').addEventListener('click', () => { chooserOpen = true; chooserLoaded = false; render(); });
   $('hide-chooser').addEventListener('click', () => { chooserOpen = false; render(); });
   $('apply-settings').addEventListener('click', () => void window.app.applySettings());

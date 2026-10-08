@@ -25,6 +25,12 @@ as a candidate, and the player picks one of them.
   GET /pr/h/<account>/settings/candidates/<device> -> one candidate
   PUT /pr/h/<account>/settings/candidates/<device> -> leaves this device's settings as a candidate
 
+Pages: the player's own list of web pages for the apps' side menus,
+{"updated": <ms>, "pages": [{"name", "url"}, ...]}.
+
+  GET /pr/h/<account>/pages   -> the list, or 404 if there is none yet
+  PUT /pr/h/<account>/pages   -> replaces it; 409 (with the stored one) if the stored one is newer
+
 Backups: copies of save data and runs in progress, {"from": "<device>", "made": <ms>, ...},
 kept under "<ms>-<device>". The newest HUB_KEEP_BACKUPS of each device are kept.
 
@@ -55,7 +61,8 @@ ACCOUNT = re.compile(r"[A-Za-z0-9_-]{1,32}")
 DEVICE = re.compile(r"[a-z0-9-]{1,40}")
 BACKUP = re.compile(r"[0-9]{10,16}-[a-z0-9-]{1,40}")
 MIN_CODE = 12
-LIMITS = {"run": 512 * 1024, "settings": 2 * 1024 * 1024, "candidate": 2 * 1024 * 1024, "backup": 16 * 1024 * 1024}
+LIMITS = {"run": 512 * 1024, "settings": 2 * 1024 * 1024, "candidate": 2 * 1024 * 1024, "backup": 16 * 1024 * 1024,
+          "pages": 256 * 1024}
 
 DIR = Path(os.environ.get("HUB_DIR", "/var/lib/pr-history"))
 PORT = int(os.environ.get("HUB_PORT", "8791"))
@@ -91,6 +98,12 @@ def is_run(value) -> bool:
 def is_settings(value) -> bool:
     return (isinstance(value, dict) and isinstance(value.get("updated"), int)
             and isinstance(value.get("from"), str) and isinstance(value.get("data"), dict))
+
+
+def is_pages(value) -> bool:
+    return (isinstance(value, dict) and isinstance(value.get("updated"), int) and isinstance(value.get("pages"), list)
+            and all(isinstance(p, dict) and isinstance(p.get("name"), str) and isinstance(p.get("url"), str)
+                    for p in value["pages"]))
 
 
 def is_backup(value) -> bool:
@@ -137,6 +150,8 @@ class Handler(BaseHTTPRequestHandler):
             return "run", folder, rest
         if rest == "settings":
             return "settings", folder, ""
+        if rest == "pages":
+            return "pages", folder, ""
         if rest == "settings/candidates/":
             return "candidates", folder, ""
         if rest.startswith("settings/candidates/") and DEVICE.fullmatch(rest[len("settings/candidates/"):]):
@@ -170,6 +185,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file(folder / f"{name}.json")
         if kind == "settings":
             return self.send_file(folder / "settings.json")
+        if kind == "pages":
+            return self.send_file(folder / "pages.json")
         if kind == "candidate":
             return self.send_file(folder / "candidates" / f"{name}.json")
         if kind == "candidates":
@@ -210,7 +227,8 @@ class Handler(BaseHTTPRequestHandler):
             value = json.loads(body)
         except (ValueError, UnicodeDecodeError):
             return self.reply(400)
-        check = {"run": is_run, "settings": is_settings, "candidate": is_settings, "backup": is_backup}[kind]
+        check = {"run": is_run, "settings": is_settings, "candidate": is_settings, "backup": is_backup,
+                 "pages": is_pages}[kind]
         if not check(value):
             return self.reply(400)
 
@@ -220,8 +238,8 @@ class Handler(BaseHTTPRequestHandler):
                 write(stored, body)
                 for old in stored_keys(folder)[KEEP:]:
                     (folder / f"{old}.json").unlink(missing_ok=True)
-        elif kind == "settings":
-            stored = folder / "settings.json"
+        elif kind in ("settings", "pages"):
+            stored = folder / f"{kind}.json"
             with self.server.lock:
                 try:
                     current = json.loads(stored.read_bytes())

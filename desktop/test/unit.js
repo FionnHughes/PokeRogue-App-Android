@@ -220,6 +220,37 @@ async function check(name, fn) {
     assert.strictEqual(JSON.parse(atPhone.write.settings).GAME_SPEED, 4);
   });
 
+  // ---- the phone app's scripts, as the desktop runs them ----
+  const fs = require('fs');
+  const path = require('path');
+  const vm = require('vm');
+  await check('vendor scripts are the phone app\'s, unchanged', () => {
+    const phone = path.join(__dirname, '..', '..', 'modern-patch', 'assets', 'savesync');
+    if (!fs.existsSync(phone)) { return; } // only checkable inside the repository
+    for (const name of ['tables.js', 'starters.js', 'team.js']) {
+      assert.strictEqual(fs.readFileSync(path.join(__dirname, '..', 'src', 'vendor', name), 'utf8'),
+        fs.readFileSync(path.join(phone, name), 'utf8'), name + ' differs from the phone app\'s copy');
+    }
+  });
+  await check('team: party, held items and other items', () => {
+    const sandbox = { window: {}, atob: (b) => Buffer.from(b, 'base64').toString('latin1') };
+    vm.createContext(sandbox);
+    for (const name of ['tables.js', 'starters.js', 'team.js']) {
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'vendor', name), 'utf8'), sandbox);
+    }
+    const text = sandbox.window.__teamTools.format(JSON.stringify({
+      waveIndex: 12, gameMode: 3, arena: { biome: 1 }, money: 500, playTime: 600,
+      party: [{ id: 7, species: 25, level: 20, nature: 0, abilityIndex: 2, moveset: [{ moveId: 85 }], shiny: true }],
+      modifiers: [{ typeId: 'BERRY', typePregenArgs: [1], args: [7, 1], stackCount: 3 }, { typeId: 'EXP_SHARE', args: [], stackCount: 1 }]
+    }), 'slot 2');
+    assert.match(text, /Daily Run, wave 12 in Plains/);
+    assert.match(text, /Pikachu ★ \(#25\), Lv 20/);
+    assert.match(text, /Item: Lum Berry x3/);
+    assert.match(text, /Ability: hidden/);
+    assert.match(text, /Moves: Thunderbolt/);
+    assert.match(text, /Other items: Exp Share/);
+  });
+
   console.log(failed ? failed + ' failed' : 'all passed');
   process.exit(failed ? 1 : 0);
 })();

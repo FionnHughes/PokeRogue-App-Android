@@ -100,6 +100,8 @@ public final class SaveSync {
     private static final int ENTRY_COPY_STARTERS = 1;
     private static final int ENTRY_RESTORE = 2;
     private static final int ENTRY_LAYOUT = 3;
+    private static final int ENTRY_PAGES = 4;
+    private static final int ENTRY_COPY_TEAM = 5;
     /** Not a drawer entry: the tips shown when the app opens. */
     private static final int ENTRY_TIPS = 100;
 
@@ -114,12 +116,13 @@ public final class SaveSync {
     private static final String OFFLINE_PAGE = "https://localhost:8080/__savesync/index.html";
     /** Scripts shipped in the APK's assets/savesync folder, served to the helper pages under this path. */
     private static final String ASSET_PATH = "/__savesync/assets/";
-    private static final String[] ASSETS = {"tables.js", "starters.js", "offline.js", "online.js"};
+    private static final String[] ASSETS = {"tables.js", "starters.js", "team.js", "offline.js", "online.js"};
     private static final String ONLINE_HTML = "<!doctype html><meta charset=\"utf-8\">"
             + "<script src=\"" + ASSET_PATH + "online.js\"></script>";
     private static final String OFFLINE_HTML = "<!doctype html><meta charset=\"utf-8\">"
             + "<script src=\"" + ASSET_PATH + "tables.js\"></script>"
             + "<script src=\"" + ASSET_PATH + "starters.js\"></script>"
+            + "<script src=\"" + ASSET_PATH + "team.js\"></script>"
             + "<script src=\"" + ASSET_PATH + "offline.js\"></script>";
 
     /** How long each step may take before the session stops waiting and shows the log. */
@@ -218,6 +221,8 @@ public final class SaveSync {
     private static final String SETTINGS_LAST = "settings_last_";
     /** Per game side and account, a fingerprint of what was last backed up to the store. */
     private static final String STORE_BACKUP = "store_backup_";
+    /** The player's own pages, as {"updated", "pages"}. */
+    private static final String PAGES = "my_pages";
     private static final int MIN_HISTORY_CODE_CHARS = 12;
     private static final int MAX_LAYOUT_CHARS = 1000;
 
@@ -354,7 +359,8 @@ public final class SaveSync {
             editLayout(activity);
             return;
         }
-        if (entry != ENTRY_SYNC && entry != ENTRY_COPY_STARTERS && entry != ENTRY_RESTORE) {
+        if (entry != ENTRY_SYNC && entry != ENTRY_COPY_STARTERS && entry != ENTRY_RESTORE
+                && entry != ENTRY_PAGES && entry != ENTRY_COPY_TEAM) {
             return;
         }
         if (current != null) {
@@ -513,6 +519,8 @@ public final class SaveSync {
             this.activity = activity;
             this.entry = entry;
             this.title = entry == ENTRY_COPY_STARTERS ? "Copy Pokémon caught"
+                    : entry == ENTRY_COPY_TEAM ? "Copy current team"
+                    : entry == ENTRY_PAGES ? "My pages"
                     : entry == ENTRY_RESTORE ? "Restore backup" : entry == ENTRY_TIPS ? "Before you play" : "Sync saves";
             this.backupDir = new File(activity.getFilesDir(), "savesync-backups");
             this.clientId = gameClientId;
@@ -528,6 +536,8 @@ public final class SaveSync {
                 showTip(0);
             } else if (entry == ENTRY_RESTORE) {
                 offerBackups();
+            } else if (entry == ENTRY_PAGES) {
+                showPages();
             } else {
                 beginCheck();
             }
@@ -904,6 +914,8 @@ public final class SaveSync {
                     sendBackupOnline();
                 } else if (entry == ENTRY_COPY_STARTERS) {
                     offerStarterLists();
+                } else if (entry == ENTRY_COPY_TEAM) {
+                    offerTeams();
                 } else {
                     showMenu();
                 }
@@ -1807,6 +1819,245 @@ public final class SaveSync {
             finish();
         }
 
+        // ---- Copy current team ----
+
+        /**
+         * The runs in progress on both sides. The same run on both (same seed) is offered
+         * once, from the side that saved it later. With one run, it is copied straight away.
+         */
+        private void offerTeams() {
+            final List<String> labels = new ArrayList<String>();
+            final List<Runnable> actions = new ArrayList<Runnable>();
+            JSONArray local = compared.optJSONArray("localSessions");
+            JSONArray online = onlineProblem == null ? compared.optJSONArray("onlineSessions") : null;
+            for (int slot = 0; slot < SLOTS; slot++) {
+                final int s = slot;
+                JSONObject mine = objectAt(local, slot);
+                JSONObject theirs = objectAt(online, slot);
+                boolean same = mine != null && theirs != null && mine.optString("seed").equals(theirs.optString("seed"));
+                boolean onlineNewer = same && theirs.optLong("timestamp") > mine.optLong("timestamp");
+                if (mine != null && !onlineNewer) {
+                    labels.add("Offline slot " + (slot + 1) + ": " + mine.optString("mode") + ", wave " + mine.optInt("wave")
+                            + (same ? " (also online)" : ""));
+                    actions.add(() -> copyTeam("offline", s));
+                }
+                if (theirs != null && (!same || onlineNewer)) {
+                    labels.add("Online slot " + (slot + 1) + ": " + theirs.optString("mode") + ", wave " + theirs.optInt("wave")
+                            + (same ? " (also offline)" : ""));
+                    actions.add(() -> copyTeam("online", s));
+                }
+            }
+            if (labels.isEmpty()) {
+                present("No run in progress on either side." + (onlineProblem != null ? "\n\nOnline: " + onlineProblem : ""),
+                        new String[0], new Runnable[0], "Close");
+                return;
+            }
+            if (labels.size() == 1) {
+                actions.get(0).run();
+                return;
+            }
+            present("Which run's team? The team, with each Pokémon's level, nature, moves and held items, goes to"
+                    + " the clipboard as text.", labels.toArray(new String[0]), actions.toArray(new Runnable[0]), "Close");
+        }
+
+        private void copyTeam(String side, int slot) {
+            showProgress("Writing out the team...", true);
+            step = LISTING;
+            expect("The team was not written out.", PAGE_TIMEOUT_MS);
+            run("window.__sync.team('" + side + "'," + slot + ");");
+        }
+
+        void onTeam(boolean ok, String text) {
+            if (closed || step != LISTING) {
+                return;
+            }
+            arrived();
+            step = IDLE;
+            if (!ok) {
+                fail("Could not write out the team: " + text);
+                return;
+            }
+            if (!copyText("PokéRogue team", text)) {
+                fail("The team could not be copied to the clipboard.");
+                return;
+            }
+            present("Copied to the clipboard:\n\n" + text, new String[0], new Runnable[0], "Close");
+        }
+
+        // ---- My pages ----
+
+        /** The player's pages: {"updated", "pages": [{"name", "url"}]}. */
+        private JSONObject loadPages() {
+            try {
+                String kept = preferences(activity).getString(PAGES, "");
+                if (!kept.isEmpty()) {
+                    return new JSONObject(kept);
+                }
+            } catch (JSONException e) {
+                // start again
+            }
+            JSONObject empty = new JSONObject();
+            try {
+                empty.put("updated", 0);
+                empty.put("pages", new JSONArray());
+            } catch (JSONException e) {
+                // cannot happen
+            }
+            return empty;
+        }
+
+        private void keepPages(JSONObject pages) {
+            preferences(activity).edit().putString(PAGES, pages.toString()).apply();
+        }
+
+        /** Shows the list, after bringing it up to date with the store when there is one. */
+        private void showPages() {
+            final String code = historyCode();
+            final String user = preferences(activity).getString(LAST_USER, "");
+            if (code.isEmpty() || user.isEmpty()) {
+                presentPages("");
+                return;
+            }
+            final String store = storeFor(user);
+            final JSONObject local = loadPages();
+            showProgress("Fetching your pages...", false);
+            new Thread(() -> {
+                String note = "";
+                JSONObject adopted = null;
+                try {
+                    JSONObject remote = SharedStore.pages(store, code);
+                    if (remote != null && remote.optLong("updated") > local.optLong("updated")) {
+                        adopted = remote;
+                    } else if (local.optLong("updated") > 0
+                            && (remote == null || local.optLong("updated") > remote.optLong("updated"))) {
+                        adopted = SharedStore.putPages(store, code, local);
+                    }
+                } catch (Exception e) {
+                    note = "Your server could not be reached (" + e.getMessage() + "), so this is the list on this phone.";
+                }
+                final JSONObject newer = adopted;
+                final String why = note;
+                MAIN.post(() -> {
+                    if (closed) {
+                        return;
+                    }
+                    if (newer != null) {
+                        keepPages(newer);
+                    }
+                    presentPages(why);
+                });
+            }, "pages-sync").start();
+        }
+
+        private void presentPages(String note) {
+            final JSONArray pages = loadPages().optJSONArray("pages");
+            int count = pages == null ? 0 : pages.length();
+            String[] labels = new String[count + 2];
+            Runnable[] actions = new Runnable[count + 2];
+            for (int i = 0; i < count; i++) {
+                final JSONObject page = pages.optJSONObject(i);
+                labels[i] = page.optString("name");
+                actions[i] = () -> {
+                    close();
+                    PageViewer.open(activity, page.optString("name"), page.optString("url"));
+                };
+            }
+            labels[count] = "Add a page";
+            actions[count] = () -> askPageAddress(-1);
+            labels[count + 1] = count > 0 ? "Change or remove a page" : null;
+            actions[count + 1] = this::editPages;
+            present("My pages\n\nYour own pages, opened over the game. The desktop app shows the same list when the"
+                    + " shared run history code is set on both." + (note.isEmpty() ? "" : "\n\n" + note)
+                    + (count == 0 ? "\n\nNo pages yet." : ""), labels, actions, "Close");
+        }
+
+        private void editPages() {
+            final JSONArray pages = loadPages().optJSONArray("pages");
+            int count = pages == null ? 0 : pages.length();
+            String[] labels = new String[count + 1];
+            Runnable[] actions = new Runnable[count + 1];
+            for (int i = 0; i < count; i++) {
+                final int index = i;
+                final JSONObject page = pages.optJSONObject(i);
+                labels[i] = page.optString("name");
+                actions[i] = () -> present(page.optString("name") + "\n" + page.optString("url"),
+                        new String[] {"Change", "Remove", "Back"},
+                        new Runnable[] {() -> askPageAddress(index), () -> changePages(index, null), this::editPages},
+                        "Close");
+            }
+            labels[count] = "Back";
+            actions[count] = this::presentPages0;
+            present("Which page?", labels, actions, "Close");
+        }
+
+        private void presentPages0() {
+            presentPages("");
+        }
+
+        private void askPageAddress(final int index) {
+            JSONArray pages = loadPages().optJSONArray("pages");
+            JSONObject page = index >= 0 && pages != null ? pages.optJSONObject(index) : null;
+            pendingInput = page != null ? page.optString("url") : "https://";
+            present("Address of the page", new String[] {"Next", "Back"},
+                    new Runnable[] {
+                        () -> {
+                            String typed = inputField == null ? "" : inputField.getText().toString().trim();
+                            if (!typed.matches("(?i)https?://[^\\s]+\\.[^\\s]+")) {
+                                Toast.makeText(activity, "That is not a web address (https://...)", Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            askPageName(index, typed);
+                        },
+                        this::presentPages0},
+                    "Close");
+        }
+
+        private void askPageName(final int index, final String url) {
+            JSONArray pages = loadPages().optJSONArray("pages");
+            JSONObject page = index >= 0 && pages != null ? pages.optJSONObject(index) : null;
+            pendingInput = page != null ? page.optString("name") : Uri.parse(url).getHost();
+            present("Name in the list", new String[] {"Save", "Back"},
+                    new Runnable[] {
+                        () -> {
+                            String typed = inputField == null ? "" : inputField.getText().toString().trim();
+                            JSONObject entry = new JSONObject();
+                            try {
+                                entry.put("name", typed.isEmpty() ? url : typed);
+                                entry.put("url", url);
+                            } catch (JSONException e) {
+                                return;
+                            }
+                            changePages(index, entry);
+                        },
+                        () -> askPageAddress(index)},
+                    "Close");
+        }
+
+        /** Replaces (index >= 0) or adds (index < 0) a page; null removes the one at index. Then sends the list. */
+        private void changePages(int index, JSONObject entry) {
+            JSONArray old = loadPages().optJSONArray("pages");
+            JSONArray pages = new JSONArray();
+            for (int i = 0; old != null && i < old.length(); i++) {
+                if (i != index) {
+                    pages.put(old.optJSONObject(i));
+                } else if (entry != null) {
+                    pages.put(entry);
+                }
+            }
+            if (index < 0 && entry != null) {
+                pages.put(entry);
+            }
+            JSONObject list = new JSONObject();
+            try {
+                list.put("updated", System.currentTimeMillis());
+                list.put("pages", pages);
+            } catch (JSONException e) {
+                return;
+            }
+            keepPages(list);
+            showPages(); // sends it when there is a store
+        }
+
         // ---- Restore backup ----
 
         private void offerBackups() {
@@ -2203,6 +2454,11 @@ public final class SaveSync {
         @JavascriptInterface
         public void onStarters(final int count, final String text) {
             MAIN.post(() -> session.onStarters(count, String.valueOf(text)));
+        }
+
+        @JavascriptInterface
+        public void onTeam(final boolean ok, final String text) {
+            MAIN.post(() -> session.onTeam(ok, String.valueOf(text)));
         }
     }
 

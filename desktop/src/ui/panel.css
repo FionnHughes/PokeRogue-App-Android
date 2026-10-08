@@ -126,3 +126,10 @@ input[type=text]:focus { border: 2px solid var(--primary); outline: none; paddin
 .candidate:hover { background: var(--hover); border-color: var(--outline); }
 .candidate .name { font-weight: 500; color: var(--on-surface); }
 .candidate .when { font-size: 12px; color: var(--on-variant); }
+
+.actions-row { margin: 0 8px 4px; }
+#page-form input + input { margin-top: 8px; }
+.item .remove { color: var(--on-variant); }
+.choice { display: block; width: calc(100% - 16px); margin: 4px 8px; text-align: left; padding: 10px 12px;
+  border-radius: 12px; border: 1px solid var(--outline-variant); }
+.choice:hover { background: var(--hover); border-color: var(--outline); }

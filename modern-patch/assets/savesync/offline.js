@@ -413,6 +413,18 @@
       }
     },
 
+    // One run in progress written out as text, for "Copy current team".
+    team: function(which, slot) {
+      try {
+        if (!window.__teamTools) { throw new Error('the name tables did not load'); }
+        var text = which === 'online' ? online.sessions[slot] : read(sessionKey(slot));
+        if (!text) { throw new Error('that slot is empty'); }
+        host.onTeam(true, window.__teamTools.format(text, which + ' slot ' + (slot + 1)));
+      } catch (e) {
+        host.onTeam(false, String((e && e.message) || e));
+      }
+    },
+
     starters: function(which) {
       try {
         if (!window.__starterTools) { throw new Error('the name tables did not load'); }
